@@ -1858,10 +1858,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
     private void handleGuiCommand(Player player, BlockData data, String cmd, GuiItemMeta meta, int slot) {
         if (cmd == null || cmd.isEmpty()) return;
+        
         if (cmd.equals("[close]")) {
             player.closeInventory();
             return;
         }
+        
         String[] prefixes = {
                 "[opengui] ",
                 "[opengui_list] ",
@@ -1871,6 +1873,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 "[teleporter_list_remove] ",
                 "[teleporter_redirect_remove] "
         };
+        
         String matched = null;
         for (String p : prefixes) {
             if (cmd.startsWith(p)) {
@@ -1878,6 +1881,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 break;
             }
         }
+        
         if (matched == null) return;
         String arg = cmd.substring(matched.length()).trim();
 
@@ -1885,10 +1889,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             openGui(player, data, arg);
             return;
         }
+        
         if (matched.equals("[opengui_list] ")) {
             openGui(player, data, "list", arg);
             return;
         }
+        
         if (matched.equals("[teleporter_page] ")) {
             GuiContext ctx = guiContexts.get(player.getUniqueId());
             int page = ctx != null ? ctx.page : 0;
@@ -1905,6 +1911,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             return;
         }
+        
         if (matched.equals("[teleporter_input] ")) {
             GuiContext ctx = guiContexts.get(player.getUniqueId());
             String listType = ctx != null ? ctx.listType : null;
@@ -1958,6 +1965,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             return;
         }
+        
         if (matched.equals("[teleporter_toggle] ")) {
             String featureKey = toggleFeatureKey(arg);
             if (featureKey != null && !featureAllowed(player, featureKey)) {
@@ -2010,6 +2018,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             openGui(player, data, meta.menuName);
             return;
         }
+        
         if (matched.equals("[teleporter_list_remove] ")) {
             if (!featureAllowed(player, "PeopleUse")) {
                 sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
