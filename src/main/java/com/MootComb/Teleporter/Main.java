@@ -68,6 +68,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private static final int DOUBLE_CLICK_DELAY_TICKS = 5;
     private static final int SNEAK_CHECK_DELAY_TICKS = 1;
     private static final int DEFAULT_END_ROD_COUNT = 5;
+    private static final int TELEPORT_LOCK_TICKS = 10;
     private static final Pattern HEX_PATTERN = Pattern.compile("&#([A-Fa-f0-9]{6})");
     private static final Pattern SRGB_PATTERN = Pattern.compile("<#([A-Fa-f0-9]{6})>");
 
@@ -156,7 +157,11 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private File blocksFile;
     private FileConfiguration blocksConfig;
 
+    private long messageCooldownMs = 3000L;
+
     private final Map<UUID, Long> cooldownMap = new HashMap<>();
+    private final Map<UUID, Long> messageCooldown = new ConcurrentHashMap<>();
+    private final Set<UUID> teleportingPlayers = ConcurrentHashMap.newKeySet();
     private final Set<String> recentInteractions = ConcurrentHashMap.newKeySet();
     private final Set<UUID> pendingPearlCancel = ConcurrentHashMap.newKeySet();
     private final Map<String, BlockData> blockDataMap = new ConcurrentHashMap<>();
@@ -455,6 +460,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         cooldownLocale = getConfig().getString("Restrictions.Cooldown.Locale", "&#FF5300Teleporter &7| &fCooldown: %time%s");
         cooldownMessageType = getMessageType(getConfig().getString("Restrictions.Cooldown.MessageType", "SUBTITLE"));
+        messageCooldownMs = getConfig().getLong("Restrictions.MessageCooldown.Milliseconds", 3000L);
 
         ConfigurationSection et = getConfig().getConfigurationSection("Titles.Elevator");
         if (et != null) {
@@ -621,10 +627,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         debug = getConfig().getBoolean("Debug", false);
     }
 
-    // ============================================================
-    //  Usage / Features helpers
-    // ============================================================
-
     private boolean usageEnabled(String usage) {
         return getConfig().getBoolean("Usage." + usage + ".Enabled", true);
     }
@@ -636,15 +638,10 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         return perm.isEmpty() || player.hasPermission(perm);
     }
 
-    // Feature flag: controls ONLY the GUI editing capability.
-    // It must NOT be used to disable gameplay mechanics.
     private boolean featureEnabled(String feature) {
         return getConfig().getBoolean("Features." + feature + ".Enabled", true);
     }
 
-    // Feature allowed: used ONLY by GUI code (hide button / block toggle).
-    // If the feature is disabled OR the player lacks the permission, the GUI
-    // editor for this category is unavailable. Gameplay is NOT affected.
     private boolean featureAllowed(Player player, String feature) {
         if (!featureEnabled(feature)) return false;
         if (!getConfig().getBoolean("Features." + feature + ".Require", false)) return true;
@@ -652,9 +649,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         return perm.isEmpty() || player.hasPermission(perm);
     }
 
-    // Default access level for newly bound blocks.
-    // Applied only when creating a new block in tryBindBlock().
-    // Independent from Enabled flag - if DefaultAccess is set, it is used.
     private AccessLevel featureDefaultAccess(String feature, AccessLevel fallback) {
         String val = getConfig().getString("Features." + feature + ".DefaultAccess");
         if (val == null) return fallback;
@@ -914,24 +908,55 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (message != null && !message.isEmpty()) sendTeleporterMessage(player, prefix + message, type);
     }
 
+    private boolean canSendMessage(Player player) {
+        UUID uuid = player.getUniqueId();
+        Long last = messageCooldown.get(uuid);
+        long now = System.currentTimeMillis();
+        if (last != null && now - last < messageCooldownMs) {
+            return false;
+        }
+        messageCooldown.put(uuid, now);
+        return true;
+    }
+
+    private void sendTeleporterPrefixedThrottled(Player player, String message, MessageType type) {
+        if (!canSendMessage(player)) return;
+        sendTeleporterPrefixed(player, message, type);
+    }
+
+    private void sendElevatorPrefixedThrottled(Player player, String message, MessageType type) {
+        if (!canSendMessage(player)) return;
+        sendElevatorPrefixed(player, message, type);
+    }
+
     private boolean isInDisabledWorld(Player player, boolean teleporter) {
         String world = player.getWorld().getName();
         return teleporter ? disabledWorldsTeleporter.contains(world) : disabledWorldsElevator.contains(world);
     }
 
-    private boolean isOnCooldown(Player player) {
-        if (!restrictionEnabled("Cooldown")) return false;
-        if (restrictionExempt(player, "Cooldown")) return false;
+    private long getCooldownRemaining(Player player) {
+        if (!restrictionEnabled("Cooldown")) return 0;
+        if (restrictionExempt(player, "Cooldown")) return 0;
         Long lastUse = cooldownMap.get(player.getUniqueId());
-        if (lastUse == null) return false;
+        if (lastUse == null) return 0;
         int cooldownTime = getConfig().getInt("Restrictions.Cooldown.Time", 30);
         long timeLeft = (lastUse + cooldownTime * 1000L) - System.currentTimeMillis();
-        if (timeLeft > 0) {
-            String msg = cooldownLocale.replace("%time%", String.valueOf(timeLeft / 1000 + 1));
-            sendTeleporterMessage(player, msg, cooldownMessageType);
+        if (timeLeft <= 0) {
+            cooldownMap.remove(player.getUniqueId());
+            return 0;
+        }
+        return timeLeft;
+    }
+
+    private boolean isOnCooldown(Player player) {
+        long left = getCooldownRemaining(player);
+        if (left > 0) {
+            if (canSendMessage(player)) {
+                String msg = cooldownLocale.replace("%time%", String.valueOf(left / 1000 + 1));
+                sendTeleporterMessage(player, msg, cooldownMessageType);
+            }
             return true;
         }
-        cooldownMap.remove(player.getUniqueId());
         return false;
     }
 
@@ -986,27 +1011,24 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         spawnTeleporterParticles(loc);
     }
 
-    // ============================================================
-    //  Elevator
-    // ============================================================
-
     private void teleportDown(Player player) {
         if (isInDisabledWorld(player, false)) return;
         if (!usageAllowed(player, "Elevator")) return;
-        if (isOnCooldown(player)) return;
+
         Location feetLocation = player.getLocation().clone();
         if (!elevatorBlocks.contains(feetLocation.getBlock().getType())) return;
+
         for (int i = 1; i <= blockDistance; i++) {
             Location checkLoc = feetLocation.clone().subtract(0, i, 0);
             if (elevatorBlocks.contains(checkLoc.getBlock().getType())) {
                 Location targetLoc = checkLoc.clone();
                 if (!isSafeLocation(targetLoc, false)) {
-                    sendElevatorPrefixed(player, msgElevatorDanger, msgElevatorDangerType);
+                    sendElevatorPrefixedThrottled(player, msgElevatorDanger, msgElevatorDangerType);
                     return;
                 }
                 player.teleport(targetLoc);
                 playElevatorEffects(targetLoc, elevatorUsageSound);
-                sendElevatorPrefixed(player, msgElevatorDown, msgElevatorDownType);
+                sendElevatorPrefixedThrottled(player, msgElevatorDown, msgElevatorDownType);
                 setCooldown(player);
                 return;
             }
@@ -1016,15 +1038,16 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private void teleportUp(Player player) {
         if (isInDisabledWorld(player, false)) return;
         if (!usageAllowed(player, "Elevator")) return;
-        if (isOnCooldown(player)) return;
+
         Location feetLocation = player.getLocation().clone();
         if (!elevatorBlocks.contains(feetLocation.getBlock().getType())) return;
+
         for (int i = 1; i <= blockDistance; i++) {
             Location checkLoc = feetLocation.clone().add(0, i, 0);
             if (elevatorBlocks.contains(checkLoc.getBlock().getType())) {
                 Location targetLoc = checkLoc.clone();
                 if (!isSafeLocation(targetLoc, false)) {
-                    sendElevatorPrefixed(player, msgElevatorDanger, msgElevatorDangerType);
+                    sendElevatorPrefixedThrottled(player, msgElevatorDanger, msgElevatorDangerType);
                     return;
                 }
                 player.setVelocity(player.getVelocity().setY(0));
@@ -1035,7 +1058,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                         if (!player.isOnline()) return;
                         player.teleport(finalLoc);
                         playElevatorEffects(finalLoc, elevatorUsageSound);
-                        sendElevatorPrefixed(player, msgElevatorUp, msgElevatorUpType);
+                        sendElevatorPrefixedThrottled(player, msgElevatorUp, msgElevatorUpType);
                         setCooldown(player);
                     }
                 }.runTask(this);
@@ -1047,28 +1070,47 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPlayerJump(PlayerMoveEvent event) {
         Player player = event.getPlayer();
+
+        if (teleportingPlayers.contains(player.getUniqueId())) return;
         if (event.getTo().getY() <= event.getFrom().getY()) return;
         if (event.getFrom().getBlock().getY() == event.getTo().getBlock().getY()) return;
+
         Location feetLocation = player.getLocation().clone();
         feetLocation.setY(feetLocation.getY() - 0.1);
-        if (usageAllowed(player, "Elevator") && elevatorBlocks.contains(feetLocation.getBlock().getType())) {
-            for (int i = 1; i <= blockDistance; i++) {
-                Location checkLoc = feetLocation.clone().add(0, i, 0);
-                if (elevatorBlocks.contains(checkLoc.getBlock().getType())) {
-                    Location targetLoc = checkLoc.clone().subtract(0, 0.65, 0);
-                    if (!isSafeLocation(targetLoc, false)) {
-                        sendElevatorPrefixed(player, msgElevatorDanger, msgElevatorDangerType);
-                        return;
-                    }
-                    player.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
-                    player.setFallDistance(0);
-                    player.teleport(targetLoc);
-                    playElevatorEffects(targetLoc, elevatorUsageSound);
-                    sendElevatorPrefixed(player, msgElevatorUp, msgElevatorUpType);
-                    setCooldown(player);
-                    return;
-                }
+
+        if (!usageAllowed(player, "Elevator")) return;
+        if (!elevatorBlocks.contains(feetLocation.getBlock().getType())) return;
+
+        for (int i = 1; i <= blockDistance; i++) {
+            Location checkLoc = feetLocation.clone().add(0, i, 0);
+            if (!elevatorBlocks.contains(checkLoc.getBlock().getType())) continue;
+
+            Location targetLoc = checkLoc.clone().subtract(0, 0.65, 0);
+            if (!isSafeLocation(targetLoc, false)) {
+                sendElevatorPrefixedThrottled(player, msgElevatorDanger, msgElevatorDangerType);
+                return;
             }
+
+            if (isOnCooldown(player)) return;
+
+            UUID uuid = player.getUniqueId();
+            teleportingPlayers.add(uuid);
+
+            player.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
+            player.setFallDistance(0);
+            player.teleport(targetLoc);
+            playElevatorEffects(targetLoc, elevatorUsageSound);
+            sendElevatorPrefixedThrottled(player, msgElevatorUp, msgElevatorUpType);
+            setCooldown(player);
+
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    teleportingPlayers.remove(uuid);
+                }
+            }.runTaskLater(this, TELEPORT_LOCK_TICKS);
+
+            return;
         }
     }
 
@@ -1076,25 +1118,33 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     public void onPlayerSneak(PlayerToggleSneakEvent event) {
         Player player = event.getPlayer();
         if (!event.isSneaking()) return;
+        if (teleportingPlayers.contains(player.getUniqueId())) return;
+
         final Player p = player;
         new BukkitRunnable() {
             @Override
             public void run() {
                 if (!p.isOnline() || !p.isSneaking()) return;
+                if (teleportingPlayers.contains(p.getUniqueId())) return;
+                if (isOnCooldown(p)) return;
+
+                UUID uuid = p.getUniqueId();
+                teleportingPlayers.add(uuid);
                 teleportDown(p);
+
+                new BukkitRunnable() {
+                    @Override
+                    public void run() {
+                        teleportingPlayers.remove(uuid);
+                    }
+                }.runTaskLater(Main.this, TELEPORT_LOCK_TICKS);
             }
         }.runTaskLater(this, SNEAK_CHECK_DELAY_TICKS);
     }
 
-    // ============================================================
-    //  Bind / Interact
-    // ============================================================
-
     private boolean canBindBlock(Player player, Block block, Material blockType, ItemStack hand) {
         if (!player.isSneaking()) return false;
         if (isInDisabledWorld(player, true)) return false;
-        // NOTE: Features.Bind controls ONLY the GUI editor.
-        // Binding new blocks is a gameplay mechanic and is not gated by it.
         BindItem bindItem = getBindItem(hand);
         if (bindItem == null) return false;
         if (!bindItemAllowed(player, bindItem)) return false;
@@ -1159,7 +1209,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         ItemStack handItem = player.getInventory().getItemInMainHand();
         boolean holdingBindItem = isBindItem(handItem);
 
-        // Bind new block
         if (data == null) {
             if (isRight && player.isSneaking() && holdingBindItem) {
                 if (canBindBlock(player, block, blockType, handItem)) {
@@ -1170,23 +1219,18 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             return;
         }
 
-        // GUI opens ONLY with RIGHT click, but the sneak requirement is inverted
-        // relative to the teleport action:
-        // - requireSneak = true  -> GUI opens WITHOUT sneak, teleport WITH sneak
-        // - requireSneak = false -> GUI opens WITH sneak,    teleport WITHOUT sneak
         boolean guiSneak = data.requireSneak ? !player.isSneaking() : player.isSneaking();
 
         if (isRight && guiSneak) {
             event.setCancelled(true);
             if (!canManage(player, data)) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return;
             }
             openGui(player, data, "main");
             return;
         }
 
-        // Teleport action
         if (!usageAllowed(player, "Teleport")) {
             debug("Usage Teleport disabled or no permission");
             return;
@@ -1208,7 +1252,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             if (data.requireItem) {
                 ItemStack item = player.getInventory().getItemInMainHand();
                 if (!itemMatches(item, data.requiredItemName)) {
-                    sendTeleporterPrefixed(player, msgMissingItem, msgMissingItemType);
+                    sendTeleporterPrefixedThrottled(player, msgMissingItem, msgMissingItemType);
                     return;
                 }
             }
@@ -1226,10 +1270,9 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         event.setCancelled(true);
 
-        // Password check: gameplay mechanic, independent from Features.Password.
         if (data.passwordEnabled && !data.password.isEmpty()) {
             pendingPasswords.put(player.getUniqueId(), new PendingPassword(data.key()));
-            sendTeleporterPrefixed(player, msgPasswordRequired, msgPasswordRequiredType);
+            sendTeleporterPrefixedThrottled(player, msgPasswordRequired, msgPasswordRequiredType);
             return;
         }
 
@@ -1275,13 +1318,11 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         data.y = block.getY();
         data.z = block.getZ();
         data.clickType = BindClickType.RIGHT;
-        // DefaultAccess is applied here regardless of Features.*.Enabled.
         data.teleportAccess = featureDefaultAccess("TeleportAccess", AccessLevel.ALL);
         data.manageAccess = featureDefaultAccess("ManageAccess", AccessLevel.OWNER);
         data.breakAccess = featureDefaultAccess("BreakAccess", AccessLevel.ALL);
         data.teleportLocation = TeleportLocation.TOP;
         data.customName = blockNamingDefaultName;
-        // Hologram default is taken from Holograms.DefaultEnabled, NOT from Features.Hologram.Enabled.
         data.hologramEnabled = hologramsDefaultEnabled;
         data.id = 0;
 
@@ -1295,20 +1336,24 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         openGui(player, data, "main");
     }
 
-    // ============================================================
-    //  Teleport logic
-    // ============================================================
-
     private void performTeleport(Player player, BlockData source) {
         if (!usageAllowed(player, "Teleport")) return;
-        if (isOnCooldown(player)) return;
+
+        long left = getCooldownRemaining(player);
+        if (left > 0) {
+            if (canSendMessage(player)) {
+                String msg = cooldownLocale.replace("%time%", String.valueOf(left / 1000 + 1));
+                sendTeleporterMessage(player, msg, cooldownMessageType);
+            }
+            return;
+        }
+
         int id = source.id;
         if (id <= 0) {
             debug("No ID");
             return;
         }
         BlockData destination = null;
-        // Redirect is a gameplay mechanic, independent from Features.Redirect.
         if (source.redirectEnabled && !source.redirectChain.isEmpty()) {
             String key = source.key();
             int idx = redirectIndex.getOrDefault(key, 0);
@@ -1325,7 +1370,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         } else {
             Set<String> keys = idIndex.get(id);
             if (keys == null || keys.size() < 2) {
-                sendTeleporterPrefixed(player, msgNoPair, msgNoPairType);
+                sendTeleporterPrefixedThrottled(player, msgNoPair, msgNoPairType);
                 return;
             }
             for (String k : keys) {
@@ -1336,7 +1381,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
         }
         if (destination == null) {
-            sendTeleporterPrefixed(player, msgNoPair, msgNoPairType);
+            sendTeleporterPrefixedThrottled(player, msgNoPair, msgNoPairType);
             return;
         }
         World destWorld = Bukkit.getWorld(destination.world);
@@ -1347,7 +1392,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (restrictionEnabled("CrossWorld") && !restrictionExempt(player, "CrossWorld")) {
             boolean allow = getConfig().getBoolean("Restrictions.CrossWorld.Allow", true);
             if (!allow && !player.getWorld().getName().equals(destination.world)) {
-                sendTeleporterPrefixed(player, msgNoCrossWorld, msgNoCrossWorldType);
+                sendTeleporterPrefixedThrottled(player, msgNoCrossWorld, msgNoCrossWorldType);
                 return;
             }
         }
@@ -1357,7 +1402,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             if (a.getWorld() != null && a.getWorld().equals(b.getWorld())) {
                 double dist = a.distance(b);
                 if (dist > maxDistance) {
-                    sendTeleporterPrefixed(player, msgDistanceTooFar, msgDistanceTooFarType);
+                    sendTeleporterPrefixedThrottled(player, msgDistanceTooFar, msgDistanceTooFarType);
                     return;
                 }
             }
@@ -1371,7 +1416,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             destLoc = new Location(destWorld, destination.x + 0.5, destination.y + 1, destination.z + 0.5, player.getLocation().getYaw(), player.getLocation().getPitch());
         }
         if (!isSafeLocation(destLoc, true)) {
-            sendTeleporterPrefixed(player, msgElevatorDanger, msgElevatorDangerType);
+            sendTeleporterPrefixedThrottled(player, msgElevatorDanger, msgElevatorDangerType);
             return;
         }
         Location sourceLoc = player.getLocation().clone();
@@ -1379,13 +1424,9 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         playTeleporterEffects(destLoc, teleporterUsageSound);
         player.teleport(destLoc);
         playTeleporterEffects(destLoc, teleporterUsageSound);
-        sendTeleporterPrefixed(player, msgTeleportSuccess, msgTeleportSuccessType);
+        sendTeleporterPrefixedThrottled(player, msgTeleportSuccess, msgTeleportSuccessType);
         setCooldown(player);
     }
-
-    // ============================================================
-    //  Break
-    // ============================================================
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onBlockBreak(BlockBreakEvent event) {
@@ -1394,8 +1435,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         String key = block.getWorld().getName() + ":" + block.getX() + ":" + block.getY() + ":" + block.getZ();
         BlockData data = blockDataMap.get(key);
         if (data == null) return;
-        // Break is a gameplay mechanic, independent from Features.BreakAccess.
-        // Only Restrictions.Access + block's breakAccess control it.
         if (restrictionEnabled("Access") && !restrictionExempt(player, "Access")) {
             if (!canBreak(player, data)) {
                 event.setCancelled(true);
@@ -1428,10 +1467,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
         saveBlocks();
     }
-
-    // ============================================================
-    //  Access checks
-    // ============================================================
 
     private boolean canTeleport(Player player, BlockData data) {
         if (restrictionEnabled("Access") && restrictionExempt(player, "Access")) return true;
@@ -1493,10 +1528,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         return false;
     }
 
-    // ============================================================
-    //  GUI
-    // ============================================================
-
     private void openGui(Player player, BlockData data, String menuName) {
         openGui(player, data, menuName, null);
     }
@@ -1539,8 +1570,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 if (itemSec == null) continue;
                 if (!checkViewRequirement(player, itemSec)) continue;
 
-                // Feature flag: hide this GUI button if the category editor is disabled
-                // or the player lacks the permission. Gameplay is NOT affected.
                 String featureKey = guiItemFeatureKey(itemKey);
                 if (featureKey != null && !featureAllowed(player, featureKey)) continue;
 
@@ -1885,35 +1914,35 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 chatSessions.put(player.getUniqueId(), new ChatInputSession("SET_ID", data.key()));
             } else if (arg.equals("SET_ITEM")) {
                 if (!featureAllowed(player, "Bind")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 sendTeleporterPrefixed(player, msgItemPrompt, msgItemPromptType);
                 chatSessions.put(player.getUniqueId(), new ChatInputSession("SET_ITEM", data.key()));
             } else if (arg.equals("SET_NAME")) {
                 if (!featureAllowed(player, "Naming")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 sendTeleporterPrefixed(player, msgNamePrompt, msgNamePromptType);
                 chatSessions.put(player.getUniqueId(), new ChatInputSession("SET_NAME", data.key()));
             } else if (arg.equals("SET_PASSWORD")) {
                 if (!featureAllowed(player, "Password")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 sendTeleporterPrefixed(player, msgPasswordPrompt, msgPasswordPromptType);
                 chatSessions.put(player.getUniqueId(), new ChatInputSession("SET_PASSWORD", data.key()));
             } else if (arg.equals("ADD_STEP")) {
                 if (!featureAllowed(player, "Redirect")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 sendTeleporterPrefixed(player, msgRedirectPrompt, msgRedirectPromptType);
                 chatSessions.put(player.getUniqueId(), new ChatInputSession("ADD_STEP", data.key()));
             } else if (arg.equals("CLEAR_STEPS")) {
                 if (!featureAllowed(player, "Redirect")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 data.redirectChain.clear();
@@ -1921,7 +1950,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 openGui(player, data, "redirect");
             } else if (arg.equals("ADD_PLAYER")) {
                 if (!featureAllowed(player, "PeopleUse")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 sendTeleporterPrefixed(player, msgListPrompt, msgListPromptType);
@@ -1932,7 +1961,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (matched.equals("[teleporter_toggle] ")) {
             String featureKey = toggleFeatureKey(arg);
             if (featureKey != null && !featureAllowed(player, featureKey)) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return;
             }
             switch (arg) {
@@ -1983,7 +2012,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
         if (matched.equals("[teleporter_list_remove] ")) {
             if (!featureAllowed(player, "PeopleUse")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return;
             }
             UUID target;
@@ -2005,7 +2034,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
         if (matched.equals("[teleporter_redirect_remove] ")) {
             if (!featureAllowed(player, "Redirect")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return;
             }
             int idx;
@@ -2073,10 +2102,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
-    // ============================================================
-    //  Chat input
-    // ============================================================
-
     @EventHandler
     public void onChat(AsyncPlayerChatEvent event) {
         Player player = event.getPlayer();
@@ -2106,10 +2131,10 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                         return;
                     }
                     if (data.password.equalsIgnoreCase(message)) {
-                        sendTeleporterPrefixed(player, msgPasswordOk, msgPasswordOkType);
+                        sendTeleporterPrefixedThrottled(player, msgPasswordOk, msgPasswordOkType);
                         performTeleport(player, data);
                     } else {
-                        sendTeleporterPrefixed(player, msgPasswordWrong, msgPasswordWrongType);
+                        sendTeleporterPrefixedThrottled(player, msgPasswordWrong, msgPasswordWrongType);
                     }
                 }
             }.runTask(this);
@@ -2148,17 +2173,17 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 try {
                     newId = Integer.parseInt(message);
                 } catch (NumberFormatException e) {
-                    sendTeleporterPrefixed(player, msgIdInvalid, msgIdInvalidType);
+                    sendTeleporterPrefixedThrottled(player, msgIdInvalid, msgIdInvalidType);
                     return;
                 }
                 if (newId <= 0 || newId > 99999) {
-                    sendTeleporterPrefixed(player, msgIdRange, msgIdRangeType);
+                    sendTeleporterPrefixedThrottled(player, msgIdRange, msgIdRangeType);
                     return;
                 }
                 Set<String> existing = idIndex.get(newId);
                 if (existing != null && !existing.isEmpty() && !(existing.size() == 1 && existing.contains(data.key()))) {
                     if (existing.size() >= 2) {
-                        sendTeleporterPrefixed(player, msgIdUsed, msgIdUsedType);
+                        sendTeleporterPrefixedThrottled(player, msgIdUsed, msgIdUsedType);
                         return;
                     }
                 }
@@ -2176,7 +2201,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             case "SET_ITEM": {
                 if (!featureAllowed(player, "Bind")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 if (message.equalsIgnoreCase("no") || message.equalsIgnoreCase("not")) {
@@ -2196,7 +2221,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             case "SET_NAME": {
                 if (!featureAllowed(player, "Naming")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 if (message.equalsIgnoreCase("no") || message.equalsIgnoreCase("not")) {
@@ -2220,7 +2245,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             case "SET_PASSWORD": {
                 if (!featureAllowed(player, "Password")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 if (message.equalsIgnoreCase("no") || message.equalsIgnoreCase("not") || message.equalsIgnoreCase("off")) {
@@ -2240,18 +2265,18 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             case "ADD_STEP": {
                 if (!featureAllowed(player, "Redirect")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 int newId;
                 try {
                     newId = Integer.parseInt(message);
                 } catch (NumberFormatException e) {
-                    sendTeleporterPrefixed(player, msgIdInvalid, msgIdInvalidType);
+                    sendTeleporterPrefixedThrottled(player, msgIdInvalid, msgIdInvalidType);
                     return;
                 }
                 if (newId <= 0 || newId > 99999) {
-                    sendTeleporterPrefixed(player, msgIdRange, msgIdRangeType);
+                    sendTeleporterPrefixedThrottled(player, msgIdRange, msgIdRangeType);
                     return;
                 }
                 data.redirectChain.add(newId);
@@ -2262,16 +2287,16 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             case "ADD_PLAYER": {
                 if (!featureAllowed(player, "PeopleUse")) {
-                    sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                    sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                     return;
                 }
                 Player target = Bukkit.getPlayerExact(message);
                 if (target == null) {
-                    sendTeleporterPrefixed(player, msgPlayerNotFound, msgPlayerNotFoundType);
+                    sendTeleporterPrefixedThrottled(player, msgPlayerNotFound, msgPlayerNotFoundType);
                     return;
                 }
                 if (session.listType == null) {
-                    sendTeleporterPrefixed(player, msgCancelled, msgCancelledType);
+                    sendTeleporterPrefixedThrottled(player, msgCancelled, msgCancelledType);
                     return;
                 }
                 Set<UUID> list = getListByType(data, session.listType);
@@ -2285,10 +2310,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
-    // ============================================================
-    //  Holograms
-    // ============================================================
-
     private void startHologramUpdater() {
         new BukkitRunnable() {
             @Override
@@ -2301,8 +2322,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     }
 
     private void updateHologram(BlockData data) {
-        // Hologram visibility depends only on the block's flag.
-        // Features.Hologram affects only the GUI editor, not the display.
         if (!data.hologramEnabled) {
             removeHologram(data);
             return;
@@ -2347,17 +2366,13 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
-    // ============================================================
-    //  View mode
-    // ============================================================
-
     private void startViewSession(Player player, String mode) {
         if (!commandAllowed(player, "View")) {
-            sendTeleporterPrefixed(player, msgViewDisabled, msgViewDisabledType);
+            sendTeleporterPrefixedThrottled(player, msgViewDisabled, msgViewDisabledType);
             return;
         }
         if (!viewModeAllowed(player, mode)) {
-            sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+            sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
             return;
         }
         stopViewSession(player);
@@ -2374,7 +2389,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 if (System.currentTimeMillis() >= endTime) {
                     cancel();
                     viewSessions.remove(player.getUniqueId());
-                    sendTeleporterPrefixed(player, msgViewDisabled, msgViewDisabledType);
+                    sendTeleporterPrefixedThrottled(player, msgViewDisabled, msgViewDisabledType);
                     return;
                 }
                 counter[0]++;
@@ -2433,12 +2448,10 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         guiItemMetaMap.remove(uuid);
         pendingPearlCancel.remove(uuid);
         pendingPasswords.remove(uuid);
+        teleportingPlayers.remove(uuid);
+        messageCooldown.remove(uuid);
         stopViewSession(event.getPlayer());
     }
-
-    // ============================================================
-    //  Commands
-    // ============================================================
 
     private Block getTargetBlock(Player player, int distance) {
         try {
@@ -2457,12 +2470,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             try {
                 id = Integer.parseInt(args[argIndex]);
             } catch (NumberFormatException e) {
-                sendTeleporterPrefixed(player, msgIdInvalid, msgIdInvalidType);
+                sendTeleporterPrefixedThrottled(player, msgIdInvalid, msgIdInvalidType);
                 return result;
             }
             Set<String> keys = idIndex.get(id);
             if (keys == null || keys.isEmpty()) {
-                sendTeleporterPrefixed(player, msgRemoveNone, msgRemoveNoneType);
+                sendTeleporterPrefixedThrottled(player, msgRemoveNone, msgRemoveNoneType);
                 return result;
             }
             for (String k : keys) {
@@ -2473,13 +2486,13 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
         Block block = getTargetBlock(player, 10);
         if (block == null) {
-            sendTeleporterPrefixed(player, msgNoBlockInSight, msgNoBlockInSightType);
+            sendTeleporterPrefixedThrottled(player, msgNoBlockInSight, msgNoBlockInSightType);
             return result;
         }
         String key = block.getWorld().getName() + ":" + block.getX() + ":" + block.getY() + ":" + block.getZ();
         BlockData data = blockDataMap.get(key);
         if (data == null) {
-            sendTeleporterPrefixed(player, msgNotTeleporter, msgNotTeleporterType);
+            sendTeleporterPrefixedThrottled(player, msgNotTeleporter, msgNotTeleporterType);
             return result;
         }
         result.add(data);
@@ -2539,7 +2552,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         if (sub.equals("info")) {
             if (!commandAllowed(player, "Info")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             List<BlockData> list = resolveBlockDataList(player, args, 1);
@@ -2552,12 +2565,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         if (sub.equals("list")) {
             if (!commandAllowed(player, "List")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             List<String> keys = playerBlocks.get(player.getUniqueId());
             if (keys == null || keys.isEmpty()) {
-                sendTeleporterPrefixed(player, msgNoBlocksOwned, msgNoBlocksOwnedType);
+                sendTeleporterPrefixedThrottled(player, msgNoBlocksOwned, msgNoBlocksOwnedType);
                 return true;
             }
             sendTeleporterPrefixed(player, msgYourBlocks, msgYourBlocksType);
@@ -2572,7 +2585,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         if (sub.equals("remove")) {
             if (!commandAllowed(player, "Remove")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             List<BlockData> list = resolveBlockDataList(player, args, 1);
@@ -2585,7 +2598,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 }
             }
             if (toRemove.isEmpty()) {
-                sendTeleporterPrefixed(player, msgRemoveNotOwner, msgRemoveNotOwnerType);
+                sendTeleporterPrefixedThrottled(player, msgRemoveNotOwner, msgRemoveNotOwnerType);
                 return true;
             }
             int id = toRemove.get(0).id;
@@ -2599,12 +2612,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (sub.equals("view")) {
             if (args.length < 2) {
                 stopViewSession(player);
-                sendTeleporterPrefixed(player, msgViewDisabled, msgViewDisabledType);
+                sendTeleporterPrefixedThrottled(player, msgViewDisabled, msgViewDisabledType);
                 return true;
             }
             String mode = args[1].toLowerCase(Locale.ROOT);
             if (!mode.equals("all") && !mode.equals("owner") && !mode.equals("member")) {
-                sendTeleporterPrefixed(player, msgViewUsage, msgViewUsageType);
+                sendTeleporterPrefixedThrottled(player, msgViewUsage, msgViewUsageType);
                 return true;
             }
             startViewSession(player, mode);
@@ -2613,7 +2626,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         if (sub.equals("menu")) {
             if (!commandAllowed(player, "Menu")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             List<BlockData> list = resolveBlockDataList(player, args, 1);
@@ -2623,7 +2636,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 if (canManage(player, d)) { target = d; break; }
             }
             if (target == null) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             openGui(player, target, "main");
@@ -2632,13 +2645,13 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         if (sub.equals("tp")) {
             if (!commandAllowed(player, "Tp")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             List<BlockData> list = resolveBlockDataList(player, args, 1);
             if (list.isEmpty()) return true;
             if (!usageAllowed(player, "Teleport")) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             BlockData target = null;
@@ -2646,12 +2659,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 if (canTeleport(player, d)) { target = d; break; }
             }
             if (target == null) {
-                sendTeleporterPrefixed(player, msgNoPermission, msgNoPermissionType);
+                sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
                 return true;
             }
             World w = Bukkit.getWorld(target.world);
             if (w == null) {
-                sendTeleporterPrefixed(player, msgBlockGone, msgBlockGoneType);
+                sendTeleporterPrefixedThrottled(player, msgBlockGone, msgBlockGoneType);
                 return true;
             }
             Location loc = new Location(w,
@@ -2662,11 +2675,11 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                     player.getLocation().getPitch());
             player.teleport(loc);
             playTeleporterEffects(loc, teleporterUsageSound);
-            sendTeleporterPrefixed(player, msgTeleportSuccess, msgTeleportSuccessType);
+            sendTeleporterPrefixedThrottled(player, msgTeleportSuccess, msgTeleportSuccessType);
             return true;
         }
 
-        sendTeleporterPrefixed(player, msgUnknownSub, msgUnknownSubType);
+        sendTeleporterPrefixedThrottled(player, msgUnknownSub, msgUnknownSubType);
         return true;
     }
 
