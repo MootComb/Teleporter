@@ -68,7 +68,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private static final int DOUBLE_CLICK_DELAY_TICKS = 5;
     private static final int SNEAK_CHECK_DELAY_TICKS = 1;
     private static final int DEFAULT_END_ROD_COUNT = 5;
-    private static final int TELEPORT_LOCK_TICKS = 10;
     private static final Pattern HEX_PATTERN = Pattern.compile("&#([A-Fa-f0-9]{6})");
     private static final Pattern SRGB_PATTERN = Pattern.compile("<#([A-Fa-f0-9]{6})>");
 
@@ -161,7 +160,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
     private final Map<UUID, Long> cooldownMap = new HashMap<>();
     private final Map<UUID, Long> messageCooldown = new ConcurrentHashMap<>();
-    private final Set<UUID> teleportingPlayers = ConcurrentHashMap.newKeySet();
     private final Set<String> recentInteractions = ConcurrentHashMap.newKeySet();
     private final Set<UUID> pendingPearlCancel = ConcurrentHashMap.newKeySet();
     private final Map<String, BlockData> blockDataMap = new ConcurrentHashMap<>();
@@ -1071,7 +1069,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     public void onPlayerJump(PlayerMoveEvent event) {
         Player player = event.getPlayer();
 
-        if (teleportingPlayers.contains(player.getUniqueId())) return;
         if (event.getTo().getY() <= event.getFrom().getY()) return;
         if (event.getFrom().getBlock().getY() == event.getTo().getBlock().getY()) return;
 
@@ -1093,22 +1090,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
             if (isOnCooldown(player)) return;
 
-            UUID uuid = player.getUniqueId();
-            teleportingPlayers.add(uuid);
-
             player.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
             player.setFallDistance(0);
             player.teleport(targetLoc);
             playElevatorEffects(targetLoc, elevatorUsageSound);
             sendElevatorPrefixedThrottled(player, msgElevatorUp, msgElevatorUpType);
             setCooldown(player);
-
-            new BukkitRunnable() {
-                @Override
-                public void run() {
-                    teleportingPlayers.remove(uuid);
-                }
-            }.runTaskLater(this, TELEPORT_LOCK_TICKS);
 
             return;
         }
@@ -1118,26 +1105,14 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     public void onPlayerSneak(PlayerToggleSneakEvent event) {
         Player player = event.getPlayer();
         if (!event.isSneaking()) return;
-        if (teleportingPlayers.contains(player.getUniqueId())) return;
 
         final Player p = player;
         new BukkitRunnable() {
             @Override
             public void run() {
                 if (!p.isOnline() || !p.isSneaking()) return;
-                if (teleportingPlayers.contains(p.getUniqueId())) return;
                 if (isOnCooldown(p)) return;
-
-                UUID uuid = p.getUniqueId();
-                teleportingPlayers.add(uuid);
                 teleportDown(p);
-
-                new BukkitRunnable() {
-                    @Override
-                    public void run() {
-                        teleportingPlayers.remove(uuid);
-                    }
-                }.runTaskLater(Main.this, TELEPORT_LOCK_TICKS);
             }
         }.runTaskLater(this, SNEAK_CHECK_DELAY_TICKS);
     }
@@ -2457,7 +2432,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         guiItemMetaMap.remove(uuid);
         pendingPearlCancel.remove(uuid);
         pendingPasswords.remove(uuid);
-        teleportingPlayers.remove(uuid);
         messageCooldown.remove(uuid);
         stopViewSession(event.getPlayer());
     }
