@@ -41,6 +41,7 @@ import org.bukkit.scheduler.BukkitRunnable;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -70,6 +71,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private static final int DEFAULT_END_ROD_COUNT = 5;
     private static final Pattern HEX_PATTERN = Pattern.compile("&#([A-Fa-f0-9]{6})");
     private static final Pattern SRGB_PATTERN = Pattern.compile("<#([A-Fa-f0-9]{6})>");
+
+    private static Method CACHED_GET_TARGET_BLOCK_EXACT = null;
+    private static boolean GET_TARGET_BLOCK_EXACT_RESOLVED = false;
+
+    private static final Map<String, Material> MATERIAL_CACHE = new ConcurrentHashMap<>();
+    private static final Map<Material, Short> MATERIAL_DATA_CACHE = new ConcurrentHashMap<>();
 
     private String prefix;
 
@@ -285,9 +292,114 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         public List<String> shiftRightCommands = new ArrayList<>();
     }
 
+    private static Material resolveMaterial(String name12, String name13plus) {
+        String key = name12 + "|" + name13plus;
+        Material cached = MATERIAL_CACHE.get(key);
+        if (cached != null) return cached;
+
+        Material m = null;
+        try {
+            m = Material.valueOf(name13plus);
+        } catch (IllegalArgumentException ignored) {}
+        if (m == null) {
+            try {
+                m = Material.valueOf(name12);
+            } catch (IllegalArgumentException ignored) {}
+        }
+        if (m != null) {
+            MATERIAL_CACHE.put(key, m);
+        }
+        return m;
+    }
+
+    private static short materialDataValue(Material mat) {
+        if (mat == null) return 0;
+        Short cached = MATERIAL_DATA_CACHE.get(mat);
+        if (cached != null) return cached;
+        short data = 0;
+        if (mat.name().equals("SKULL_ITEM")) {
+            data = 3;
+        }
+        MATERIAL_DATA_CACHE.put(mat, data);
+        return data;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static ItemStack createPlayerHead() {
+        Material m = resolveMaterial("SKULL_ITEM", "PLAYER_HEAD");
+        if (m == null) return new ItemStack(Material.STONE);
+        return new ItemStack(m, 1, materialDataValue(m));
+    }
+
+    @SuppressWarnings("deprecation")
+    private static ItemStack createStack(Material mat) {
+        if (mat == null) return new ItemStack(Material.STONE);
+        short data = materialDataValue(mat);
+        if (data != 0) {
+            return new ItemStack(mat, 1, data);
+        }
+        return new ItemStack(mat);
+    }
+
+    private static Material materialFromConfig(String name) {
+        if (name == null || name.isEmpty()) return null;
+        String upper = name.toUpperCase(Locale.ROOT);
+        if (upper.equals("PLAYER_HEAD")) {
+            return resolveMaterial("SKULL_ITEM", "PLAYER_HEAD");
+        }
+        String cacheKey = "CFG|" + upper;
+        Material cached = MATERIAL_CACHE.get(cacheKey);
+        if (cached != null) return cached;
+        Material m;
+        try {
+            m = Material.valueOf(upper);
+        } catch (IllegalArgumentException e) {
+            m = null;
+        }
+        if (m != null) {
+            MATERIAL_CACHE.put(cacheKey, m);
+        }
+        return m;
+    }
+
+    private static void initTargetBlockExactReflection() {
+        if (GET_TARGET_BLOCK_EXACT_RESOLVED) return;
+        GET_TARGET_BLOCK_EXACT_RESOLVED = true;
+        try {
+            CACHED_GET_TARGET_BLOCK_EXACT = Player.class.getMethod("getTargetBlockExact", int.class);
+            CACHED_GET_TARGET_BLOCK_EXACT.setAccessible(true);
+        } catch (NoSuchMethodException ignored) {
+            CACHED_GET_TARGET_BLOCK_EXACT = null;
+        }
+    }
+
+    private Block getTargetBlock(Player player, int distance) {
+        initTargetBlockExactReflection();
+        if (CACHED_GET_TARGET_BLOCK_EXACT != null) {
+            try {
+                return (Block) CACHED_GET_TARGET_BLOCK_EXACT.invoke(player, distance);
+            } catch (ReflectiveOperationException ignored) {
+            }
+        }
+        @SuppressWarnings("deprecation")
+        Block b = player.getTargetBlock((Set<Material>) null, distance);
+        return b;
+    }
+
+    private static String hexToMinecraft(String hex6) {
+        if (hex6 == null || hex6.length() != 6) return "";
+        StringBuilder sb = new StringBuilder(14);
+        sb.append('\u00A7').append('x');
+        for (int i = 0; i < 6; i++) {
+            sb.append('\u00A7').append(hex6.charAt(i));
+        }
+        return sb.toString();
+    }
+
     @Override
     public void onEnable() {
         instance = this;
+        initTargetBlockExactReflection();
         loadConfig();
         loadBlocks();
         getServer().getPluginManager().registerEvents(this, this);
@@ -300,6 +412,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         getLogger().info("   Teleporter Plugin Enabled!");
         getLogger().info("   Elevator blocks: " + elevatorBlocks.size());
         getLogger().info("   Registered blocks: " + blockDataMap.size());
+        getLogger().info("   getTargetBlockExact available: " + (CACHED_GET_TARGET_BLOCK_EXACT != null));
         getLogger().info("==================================================");
     }
 
@@ -320,20 +433,23 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private String color(String message) {
         if (message == null) return "";
         String msg = message;
+
         Matcher matcher = HEX_PATTERN.matcher(msg);
         StringBuffer buffer = new StringBuffer();
         while (matcher.find()) {
-            matcher.appendReplacement(buffer, net.md_5.bungee.api.ChatColor.of("#" + matcher.group(1)).toString());
+            matcher.appendReplacement(buffer, Matcher.quoteReplacement(hexToMinecraft(matcher.group(1))));
         }
         matcher.appendTail(buffer);
         msg = buffer.toString();
+
         Matcher srgb = SRGB_PATTERN.matcher(msg);
         StringBuffer buffer2 = new StringBuffer();
         while (srgb.find()) {
-            srgb.appendReplacement(buffer2, net.md_5.bungee.api.ChatColor.of("#" + srgb.group(1)).toString());
+            srgb.appendReplacement(buffer2, Matcher.quoteReplacement(hexToMinecraft(srgb.group(1))));
         }
         srgb.appendTail(buffer2);
         msg = buffer2.toString();
+
         return ChatColor.translateAlternateColorCodes('&', msg);
     }
 
@@ -395,7 +511,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         elevatorBlocks.clear();
         for (String blockName : getConfig().getStringList("Elevator.BlockTypes")) {
-            Material mat = Material.getMaterial(blockName);
+            Material mat = materialFromConfig(blockName);
             if (mat != null) elevatorBlocks.add(mat);
             else getLogger().warning("Unknown elevator block: " + blockName);
         }
@@ -430,7 +546,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         List<String> teleporterBlockNames = getConfig().getStringList("Teleporter.BlockTypes");
         if (teleporterBlockNames.isEmpty()) teleporterBlockNames.add("SEA_LANTERN");
         for (String blockName : teleporterBlockNames) {
-            Material mat = Material.getMaterial(blockName);
+            Material mat = materialFromConfig(blockName);
             if (mat != null) teleporterBlockTypes.add(mat);
             else getLogger().warning("Unknown teleporter block: " + blockName);
         }
@@ -439,7 +555,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         ConfigurationSection bindItems = getConfig().getConfigurationSection("Teleporter.Bind.Items");
         if (bindItems != null) {
             for (String key : bindItems.getKeys(false)) {
-                Material mat = Material.getMaterial(key);
+                Material mat = materialFromConfig(key);
                 if (mat == null) {
                     getLogger().warning("Unknown bind item: " + key);
                     continue;
@@ -1549,12 +1665,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 if (featureKey != null && !featureAllowed(player, featureKey)) continue;
 
                 String materialName = itemSec.getString("material", "STONE");
-                Material mat;
-                try {
-                    mat = Material.valueOf(materialName.toUpperCase(Locale.ROOT));
-                } catch (IllegalArgumentException e) {
-                    mat = Material.STONE;
-                }
+                Material mat = materialFromConfig(materialName);
+                if (mat == null) mat = Material.STONE;
                 int slot = itemSec.getInt("slot", -1);
                 if (slot < 0 || slot >= size) continue;
                 String display = replacePlaceholders(itemSec.getString("display_name", ""), player, data, listType, null, 0, page);
@@ -1582,12 +1694,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 ConfigurationSection entry = dyn.getConfigurationSection("player_entry");
                 if (entry != null) {
                     String materialName = entry.getString("material", "PLAYER_HEAD");
-                    Material mat;
-                    try {
-                        mat = Material.valueOf(materialName.toUpperCase(Locale.ROOT));
-                    } catch (IllegalArgumentException e) {
-                        mat = Material.PLAYER_HEAD;
-                    }
+                    Material mat = materialFromConfig(materialName);
+                    if (mat == null) mat = resolveMaterial("SKULL_ITEM", "PLAYER_HEAD");
                     int startSlot = dyn.getInt("slots.start", 0);
                     int endSlot = dyn.getInt("slots.end", size - 10);
                     List<UUID> sorted = new ArrayList<>(list);
@@ -1627,12 +1735,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 ConfigurationSection entry = dyn.getConfigurationSection("step_entry");
                 if (entry != null) {
                     String materialName = entry.getString("material", "PAPER");
-                    Material mat;
-                    try {
-                        mat = Material.valueOf(materialName.toUpperCase(Locale.ROOT));
-                    } catch (IllegalArgumentException e) {
-                        mat = Material.PAPER;
-                    }
+                    Material mat = materialFromConfig(materialName);
+                    if (mat == null) mat = Material.PAPER;
                     int startSlot = dyn.getInt("slots.start", 9);
                     int endSlot = dyn.getInt("slots.end", 44);
                     int idx = 0;
@@ -1695,12 +1799,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         String type = vr.getString("type", "");
         if (type.equalsIgnoreCase("holding_item")) {
             String matName = vr.getString("material", "");
-            Material mat;
-            try {
-                mat = Material.valueOf(matName.toUpperCase(Locale.ROOT));
-            } catch (IllegalArgumentException e) {
-                return true;
-            }
+            Material mat = materialFromConfig(matName);
+            if (mat == null) return true;
             ItemStack hand = player.getInventory().getItemInMainHand();
             return hand != null && hand.getType() == mat;
         }
@@ -1758,8 +1858,9 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         return createItem(mat, name, lore, false);
     }
 
+    @SuppressWarnings("deprecation")
     private ItemStack createItem(Material mat, String name, List<String> lore, boolean hideAttributes) {
-        ItemStack item = new ItemStack(mat);
+        ItemStack item = createStack(mat);
         ItemMeta meta = item.getItemMeta();
         if (meta != null) {
             meta.setDisplayName(color(name));
@@ -1833,12 +1934,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
     private void handleGuiCommand(Player player, BlockData data, String cmd, GuiItemMeta meta, int slot) {
         if (cmd == null || cmd.isEmpty()) return;
-        
+
         if (cmd.equals("[close]")) {
             player.closeInventory();
             return;
         }
-        
+
         String[] prefixes = {
                 "[opengui] ",
                 "[opengui_list] ",
@@ -1848,7 +1949,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 "[teleporter_list_remove] ",
                 "[teleporter_redirect_remove] "
         };
-        
+
         String matched = null;
         for (String p : prefixes) {
             if (cmd.startsWith(p)) {
@@ -1856,7 +1957,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 break;
             }
         }
-        
+
         if (matched == null) return;
         String arg = cmd.substring(matched.length()).trim();
 
@@ -1864,12 +1965,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             openGui(player, data, arg);
             return;
         }
-        
+
         if (matched.equals("[opengui_list] ")) {
             openGui(player, data, "list", arg);
             return;
         }
-        
+
         if (matched.equals("[teleporter_page] ")) {
             GuiContext ctx = guiContexts.get(player.getUniqueId());
             int page = ctx != null ? ctx.page : 0;
@@ -1886,7 +1987,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             return;
         }
-        
+
         if (matched.equals("[teleporter_input] ")) {
             GuiContext ctx = guiContexts.get(player.getUniqueId());
             String listType = ctx != null ? ctx.listType : null;
@@ -1940,7 +2041,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             }
             return;
         }
-        
+
         if (matched.equals("[teleporter_toggle] ")) {
             String featureKey = toggleFeatureKey(arg);
             if (featureKey != null && !featureAllowed(player, featureKey)) {
@@ -1993,7 +2094,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             openGui(player, data, meta.menuName);
             return;
         }
-        
+
         if (matched.equals("[teleporter_list_remove] ")) {
             if (!featureAllowed(player, "PeopleUse")) {
                 sendTeleporterPrefixedThrottled(player, msgNoPermission, msgNoPermissionType);
@@ -2434,16 +2535,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         pendingPasswords.remove(uuid);
         messageCooldown.remove(uuid);
         stopViewSession(event.getPlayer());
-    }
-
-    private Block getTargetBlock(Player player, int distance) {
-        try {
-            return player.getTargetBlockExact(distance);
-        } catch (NoSuchMethodError e) {
-            @SuppressWarnings("deprecation")
-            Block b = player.getTargetBlock((Set<Material>) null, distance);
-            return b;
-        }
     }
 
     private List<BlockData> resolveBlockDataList(Player player, String[] args, int argIndex) {
