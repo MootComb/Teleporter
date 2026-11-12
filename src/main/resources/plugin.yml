@@ -1,7 +1,8 @@
 name: Teleporter
-version: 2.4
 main: com.MootComb.Teleporter.Main
+version: 2.5
 api-version: 1.13
+folia-supported: true
 author: MootComb
 description: Teleporter and elevator plugin with GUI management.
 commands:
