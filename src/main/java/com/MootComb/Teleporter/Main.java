@@ -54,6 +54,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -77,6 +78,20 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
     private static final Map<String, Material> MATERIAL_CACHE = new ConcurrentHashMap<>();
     private static final Map<Material, Short> MATERIAL_DATA_CACHE = new ConcurrentHashMap<>();
+
+    private static boolean FOLIA = false;
+    private static Method F_GET_REGION = null;
+    private static Method F_GET_GLOBAL = null;
+    private static Method F_GET_ASYNC = null;
+    private static Method F_ENTITY_SCHED = null;
+    private static Method F_ENTITY_EXEC = null;
+    private static Method F_REGION_EXEC = null;
+    private static Method F_REGION_RUN = null;
+    private static Method F_REGION_RUN_DELAYED = null;
+    private static Method F_REGION_RUN_AT_FIXED_RATE = null;
+    private static Method F_GLOBAL_RUN = null;
+    private static Method F_GLOBAL_RUN_DELAYED = null;
+    private static Method F_GLOBAL_RUN_AT_FIXED_RATE = null;
 
     private String prefix;
 
@@ -165,7 +180,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
     private long messageCooldownMs = 3000L;
 
-    private final Map<UUID, Long> cooldownMap = new HashMap<>();
+    private final Map<UUID, Long> cooldownMap = new ConcurrentHashMap<>();
     private final Map<UUID, Long> messageCooldown = new ConcurrentHashMap<>();
     private final Set<String> recentInteractions = ConcurrentHashMap.newKeySet();
     private final Set<UUID> pendingPearlCancel = ConcurrentHashMap.newKeySet();
@@ -175,13 +190,13 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private final Map<UUID, Set<UUID>> globalMembers = new ConcurrentHashMap<>();
     private final Map<UUID, Set<UUID>> globalGovernings = new ConcurrentHashMap<>();
     private final Map<UUID, ChatInputSession> chatSessions = new ConcurrentHashMap<>();
-    private final Map<UUID, Inventory> openGuis = new HashMap<>();
-    private final Map<UUID, GuiContext> guiContexts = new HashMap<>();
-    private final Map<UUID, ViewSession> viewSessions = new HashMap<>();
+    private final Map<UUID, Inventory> openGuis = new ConcurrentHashMap<>();
+    private final Map<UUID, GuiContext> guiContexts = new ConcurrentHashMap<>();
+    private final Map<UUID, ViewSession> viewSessions = new ConcurrentHashMap<>();
     private final Map<String, UUID> hologramEntities = new ConcurrentHashMap<>();
     private final Map<String, Integer> redirectIndex = new ConcurrentHashMap<>();
     private final Map<UUID, PendingPassword> pendingPasswords = new ConcurrentHashMap<>();
-    private final Map<UUID, Map<Integer, GuiItemMeta>> guiItemMetaMap = new HashMap<>();
+    private final Map<UUID, Map<Integer, GuiItemMeta>> guiItemMetaMap = new ConcurrentHashMap<>();
 
     public static class BindItem {
         public Material material;
@@ -264,12 +279,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     public static class ViewSession {
         public String mode;
         public long endTime;
-        public int taskId;
+        public Object taskHandle;
 
-        public ViewSession(String mode, long endTime, int taskId) {
+        public ViewSession(String mode, long endTime, Object taskHandle) {
             this.mode = mode;
             this.endTime = endTime;
-            this.taskId = taskId;
+            this.taskHandle = taskHandle;
         }
     }
 
@@ -373,33 +388,147 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
-    private Block getTargetBlock(Player player, int distance) {
-        initTargetBlockExactReflection();
-        if (CACHED_GET_TARGET_BLOCK_EXACT != null) {
-            try {
-                return (Block) CACHED_GET_TARGET_BLOCK_EXACT.invoke(player, distance);
-            } catch (ReflectiveOperationException ignored) {
-            }
+    private static void initFoliaReflection() {
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            FOLIA = true;
+        } catch (ClassNotFoundException e) {
+            FOLIA = false;
+            return;
         }
-        @SuppressWarnings("deprecation")
-        Block b = player.getTargetBlock((Set<Material>) null, distance);
-        return b;
+        try {
+            F_GET_REGION = Bukkit.class.getMethod("getRegionScheduler");
+            F_GET_GLOBAL = Bukkit.class.getMethod("getGlobalRegionScheduler");
+            F_GET_ASYNC = Bukkit.class.getMethod("getAsyncScheduler");
+        } catch (NoSuchMethodException e) {
+            FOLIA = false;
+            return;
+        }
+        try {
+            F_ENTITY_SCHED = Entity.class.getMethod("getScheduler");
+            Class<?> es = Class.forName("io.papermc.paper.threadedregions.scheduler.EntityScheduler");
+            F_ENTITY_EXEC = es.getMethod("execute", org.bukkit.plugin.Plugin.class, Runnable.class, Runnable.class);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> rs = Class.forName("io.papermc.paper.threadedregions.scheduler.RegionScheduler");
+            F_REGION_EXEC = rs.getMethod("execute", org.bukkit.plugin.Plugin.class, Location.class, Runnable.class);
+            F_REGION_RUN = rs.getMethod("run", org.bukkit.plugin.Plugin.class, Location.class, Consumer.class);
+            F_REGION_RUN_DELAYED = rs.getMethod("runDelayed", org.bukkit.plugin.Plugin.class, Location.class, Consumer.class, long.class);
+            F_REGION_RUN_AT_FIXED_RATE = rs.getMethod("runAtFixedRate", org.bukkit.plugin.Plugin.class, Location.class, Consumer.class, long.class, long.class);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> gs = Class.forName("io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler");
+            F_GLOBAL_RUN = gs.getMethod("run", org.bukkit.plugin.Plugin.class, Consumer.class);
+            F_GLOBAL_RUN_DELAYED = gs.getMethod("runDelayed", org.bukkit.plugin.Plugin.class, Consumer.class, long.class);
+            F_GLOBAL_RUN_AT_FIXED_RATE = gs.getMethod("runAtFixedRate", org.bukkit.plugin.Plugin.class, Consumer.class, long.class, long.class);
+        } catch (Throwable ignored) {
+        }
     }
 
-    private static String hexToMinecraft(String hex6) {
-        if (hex6 == null || hex6.length() != 6) return "";
-        StringBuilder sb = new StringBuilder(14);
-        sb.append('\u00A7').append('x');
-        for (int i = 0; i < 6; i++) {
-            sb.append('\u00A7').append(hex6.charAt(i));
+    private final class Sched {
+        void run(Player player, Runnable task) {
+            if (FOLIA) {
+                try {
+                    F_ENTITY_EXEC.invoke(F_ENTITY_SCHED.invoke(player), Main.this, task, (Runnable) null);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            Bukkit.getScheduler().runTask(Main.this, task);
         }
-        return sb.toString();
+
+        void later(Player player, Runnable task, long delayTicks) {
+            if (FOLIA) {
+                try {
+                    F_REGION_RUN_DELAYED.invoke(F_GET_REGION.invoke(Bukkit.getServer()), Main.this, player.getLocation(),
+                            (Consumer<Object>) t -> task.run(), delayTicks);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            Bukkit.getScheduler().runTaskLater(Main.this, task, delayTicks);
+        }
+
+        void at(Location loc, Runnable task) {
+            if (FOLIA) {
+                try {
+                    F_REGION_EXEC.invoke(F_GET_REGION.invoke(Bukkit.getServer()), Main.this, loc, task);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            Bukkit.getScheduler().runTask(Main.this, task);
+        }
+
+        void entity(Entity entity, Runnable task) {
+            if (FOLIA) {
+                try {
+                    F_ENTITY_EXEC.invoke(F_ENTITY_SCHED.invoke(entity), Main.this, task, (Runnable) null);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            Bukkit.getScheduler().runTask(Main.this, task);
+        }
+
+        void global(Runnable task) {
+            if (FOLIA) {
+                try {
+                    F_GLOBAL_RUN.invoke(F_GET_GLOBAL.invoke(Bukkit.getServer()), Main.this, (Consumer<Object>) t -> task.run());
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            Bukkit.getScheduler().runTask(Main.this, task);
+        }
+
+        void globalTimer(Runnable task, long delayTicks, long periodTicks) {
+            if (FOLIA) {
+                try {
+                    F_GLOBAL_RUN_AT_FIXED_RATE.invoke(F_GET_GLOBAL.invoke(Bukkit.getServer()), Main.this,
+                            (Consumer<Object>) t -> task.run(), delayTicks, periodTicks);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            Bukkit.getScheduler().runTaskTimer(Main.this, task, delayTicks, periodTicks);
+        }
+
+        Object regionTimer(Location loc, Runnable task, long delayTicks, long periodTicks) {
+            if (FOLIA) {
+                try {
+                    return F_REGION_RUN_AT_FIXED_RATE.invoke(F_GET_REGION.invoke(Bukkit.getServer()), Main.this, loc,
+                            (Consumer<Object>) t -> task.run(), delayTicks, periodTicks);
+                } catch (Throwable ignored) {
+                }
+            }
+            return Bukkit.getScheduler().runTaskTimer(Main.this, task, delayTicks, periodTicks).getTaskId();
+        }
+
+        void cancel(Object handle) {
+            if (handle == null) return;
+            if (FOLIA) {
+                try {
+                    handle.getClass().getMethod("cancel").invoke(handle);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (handle instanceof Integer) {
+                Bukkit.getScheduler().cancelTask((Integer) handle);
+            }
+        }
     }
+
+    private final Sched sched = new Sched();
 
     @Override
     public void onEnable() {
         instance = this;
         initTargetBlockExactReflection();
+        initFoliaReflection();
         loadConfig();
         loadBlocks();
         getServer().getPluginManager().registerEvents(this, this);
@@ -410,6 +539,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         startHologramUpdater();
         getLogger().info("==================================================");
         getLogger().info("   Teleporter Plugin Enabled!");
+        getLogger().info("   Folia: " + FOLIA);
         getLogger().info("   Elevator blocks: " + elevatorBlocks.size());
         getLogger().info("   Registered blocks: " + blockDataMap.size());
         getLogger().info("   getTargetBlockExact available: " + (CACHED_GET_TARGET_BLOCK_EXACT != null));
@@ -419,7 +549,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     @Override
     public void onDisable() {
         for (ViewSession session : viewSessions.values()) {
-            Bukkit.getScheduler().cancelTask(session.taskId);
+            sched.cancel(session.taskHandle);
         }
         viewSessions.clear();
         for (BlockData data : blockDataMap.values()) {
@@ -1166,7 +1296,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 }
                 player.setVelocity(player.getVelocity().setY(0));
                 final Location finalLoc = targetLoc;
-                new BukkitRunnable() {
+                sched.run(player, new Runnable() {
                     @Override
                     public void run() {
                         if (!player.isOnline()) return;
@@ -1175,7 +1305,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                         sendElevatorPrefixedThrottled(player, msgElevatorUp, msgElevatorUpType);
                         setCooldown(player);
                     }
-                }.runTask(this);
+                });
                 return;
             }
         }
@@ -1223,14 +1353,14 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (!event.isSneaking()) return;
 
         final Player p = player;
-        new BukkitRunnable() {
+        sched.later(p, new Runnable() {
             @Override
             public void run() {
                 if (!p.isOnline() || !p.isSneaking()) return;
                 if (isOnCooldown(p)) return;
                 teleportDown(p);
             }
-        }.runTaskLater(this, SNEAK_CHECK_DELAY_TICKS);
+        }, SNEAK_CHECK_DELAY_TICKS);
     }
 
     private boolean canBindBlock(Player player, Block block, Material blockType, ItemStack hand) {
@@ -1275,13 +1405,13 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         } catch (Throwable ignored) {}
         player.setMetadata("teleporter_cancel_pearl", new FixedMetadataValue(this, System.currentTimeMillis() + 300L));
         pendingPearlCancel.add(player.getUniqueId());
-        new BukkitRunnable() {
+        sched.later(player, new Runnable() {
             @Override
             public void run() {
                 pendingPearlCancel.remove(player.getUniqueId());
                 if (player.hasMetadata("teleporter_cancel_pearl")) player.removeMetadata("teleporter_cancel_pearl", Main.this);
             }
-        }.runTaskLater(this, 5L);
+        }, 5L);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)
@@ -1352,12 +1482,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         String interactionKey = player.getUniqueId() + ":" + key;
         if (recentInteractions.contains(interactionKey)) return;
         recentInteractions.add(interactionKey);
-        new BukkitRunnable() {
+        sched.later(player, new Runnable() {
             @Override
             public void run() {
                 recentInteractions.remove(interactionKey);
             }
-        }.runTaskLater(this, DOUBLE_CLICK_DELAY_TICKS);
+        }, DOUBLE_CLICK_DELAY_TICKS);
 
         event.setCancelled(true);
 
@@ -2208,7 +2338,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 player.sendMessage(color(prefix + msgBlockGone));
                 return;
             }
-            new BukkitRunnable() {
+            sched.run(player, new Runnable() {
                 @Override
                 public void run() {
                     if (!data.passwordEnabled) {
@@ -2222,7 +2352,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                         sendTeleporterPrefixedThrottled(player, msgPasswordWrong, msgPasswordWrongType);
                     }
                 }
-            }.runTask(this);
+            });
             return;
         }
         ChatInputSession session = chatSessions.get(player.getUniqueId());
@@ -2243,12 +2373,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             player.sendMessage(color(prefix + msgBlockGone));
             return;
         }
-        new BukkitRunnable() {
+        sched.run(player, new Runnable() {
             @Override
             public void run() {
                 handleChatInput(player, data, session, message);
             }
-        }.runTask(this);
+        });
     }
 
     private void handleChatInput(Player player, BlockData data, ChatInputSession session, String message) {
@@ -2396,14 +2526,14 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     }
 
     private void startHologramUpdater() {
-        new BukkitRunnable() {
+        sched.globalTimer(new Runnable() {
             @Override
             public void run() {
                 for (BlockData data : blockDataMap.values()) {
                     if (data.hologramEnabled) updateHologram(data);
                 }
             }
-        }.runTaskTimer(this, 20L, Math.max(1, hologramsUpdateInterval));
+        }, 20L, Math.max(1, hologramsUpdateInterval));
     }
 
     private void updateHologram(BlockData data) {
@@ -2426,28 +2556,50 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             else hologramEntities.remove(data.key());
         }
         if (stand == null) {
-            stand = w.spawn(loc, ArmorStand.class, as -> {
-                as.setVisible(false);
-                as.setGravity(false);
-                as.setMarker(true);
-                as.setSmall(true);
-                as.setCustomNameVisible(true);
-                as.setInvulnerable(true);
-                as.setBasePlate(false);
-                as.setArms(false);
+            final String holoKey = data.key();
+            final String holoName = color(data.customName);
+            sched.at(loc, new Runnable() {
+                @Override
+                public void run() {
+                    ArmorStand as = w.spawn(loc, ArmorStand.class, spawned -> {
+                        spawned.setVisible(false);
+                        spawned.setGravity(false);
+                        spawned.setMarker(true);
+                        spawned.setSmall(true);
+                        spawned.setCustomNameVisible(true);
+                        spawned.setInvulnerable(true);
+                        spawned.setBasePlate(false);
+                        spawned.setArms(false);
+                    });
+                    as.setCustomName(holoName);
+                    hologramEntities.put(holoKey, as.getUniqueId());
+                }
             });
-            hologramEntities.put(data.key(), stand.getUniqueId());
         } else {
-            stand.teleport(loc);
+            final ArmorStand s = stand;
+            final String holoName = color(data.customName);
+            sched.entity(s, new Runnable() {
+                @Override
+                public void run() {
+                    s.teleport(loc);
+                    s.setCustomName(holoName);
+                }
+            });
         }
-        stand.setCustomName(color(data.customName));
     }
 
     private void removeHologram(BlockData data) {
         UUID id = hologramEntities.remove(data.key());
         if (id != null) {
             Entity e = Bukkit.getEntity(id);
-            if (e != null) e.remove();
+            if (e != null) {
+                sched.entity(e, new Runnable() {
+                    @Override
+                    public void run() {
+                        e.remove();
+                    }
+                });
+            }
         }
     }
 
@@ -2463,44 +2615,44 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         stopViewSession(player);
         long endTime = System.currentTimeMillis() + (viewDurationTicks * 50L);
         final int[] counter = {0};
-        BukkitRunnable runnable = new BukkitRunnable() {
+        final Player viewPlayer = player;
+        final String viewMode = mode;
+        Runnable task = new Runnable() {
             @Override
             public void run() {
-                if (!player.isOnline()) {
-                    cancel();
-                    viewSessions.remove(player.getUniqueId());
+                if (!viewPlayer.isOnline()) {
+                    stopViewSession(viewPlayer);
                     return;
                 }
                 if (System.currentTimeMillis() >= endTime) {
-                    cancel();
-                    viewSessions.remove(player.getUniqueId());
-                    sendTeleporterPrefixedThrottled(player, msgViewDisabled, msgViewDisabledType);
+                    stopViewSession(viewPlayer);
+                    sendTeleporterPrefixedThrottled(viewPlayer, msgViewDisabled, msgViewDisabledType);
                     return;
                 }
                 counter[0]++;
                 if (counter[0] % Math.max(1, viewUpdateTicks) != 0) return;
                 for (BlockData data : blockDataMap.values()) {
-                    if (!matchesViewMode(player, data, mode)) continue;
+                    if (!matchesViewMode(viewPlayer, data, viewMode)) continue;
                     World w = Bukkit.getWorld(data.world);
                     if (w == null) continue;
-                    if (!w.getName().equals(player.getWorld().getName())) continue;
+                    if (!w.getName().equals(viewPlayer.getWorld().getName())) continue;
                     Location loc = new Location(w, data.x + 0.5, data.y + 1.2, data.z + 0.5);
-                    if (loc.distanceSquared(player.getLocation()) > (double) viewMaxDistance * viewMaxDistance) continue;
+                    if (loc.distanceSquared(viewPlayer.getLocation()) > (double) viewMaxDistance * viewMaxDistance) continue;
                     try {
-                        player.spawnParticle(viewParticleType, loc, viewParticleCount, 0.2, 0.2, 0.2, 0.01);
-                        player.spawnParticle(teleporterParticleType, loc, 2, 0.3, 0.3, 0.3, 0.01);
+                        viewPlayer.spawnParticle(viewParticleType, loc, viewParticleCount, 0.2, 0.2, 0.2, 0.01);
+                        viewPlayer.spawnParticle(teleporterParticleType, loc, 2, 0.3, 0.3, 0.3, 0.01);
                     } catch (Exception ignored) {}
                 }
             }
         };
-        int taskId = runnable.runTaskTimer(this, 0L, 1L).getTaskId();
-        viewSessions.put(player.getUniqueId(), new ViewSession(mode, endTime, taskId));
+        Object taskHandle = sched.regionTimer(player.getLocation(), task, 0L, 1L);
+        viewSessions.put(player.getUniqueId(), new ViewSession(mode, endTime, taskHandle));
         sendTeleporterPrefixed(player, msgViewEnabled.replace("%mode%", mode), msgViewEnabledType);
     }
 
     private void stopViewSession(Player player) {
         ViewSession session = viewSessions.remove(player.getUniqueId());
-        if (session != null) Bukkit.getScheduler().cancelTask(session.taskId);
+        if (session != null) sched.cancel(session.taskHandle);
     }
 
     private boolean matchesViewMode(Player player, BlockData data, String mode) {
@@ -2741,15 +2893,23 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 sendTeleporterPrefixedThrottled(player, msgBlockGone, msgBlockGoneType);
                 return true;
             }
-            Location loc = new Location(w,
-                    target.x + 0.5,
-                    target.y + 1,
-                    target.z + 0.5,
-                    player.getLocation().getYaw(),
-                    player.getLocation().getPitch());
-            player.teleport(loc);
-            playTeleporterEffects(loc, teleporterUsageSound);
-            sendTeleporterPrefixedThrottled(player, msgTeleportSuccess, msgTeleportSuccessType);
+            final BlockData finalTarget = target;
+            final World finalWorld = w;
+            sched.run(player, new Runnable() {
+                @Override
+                public void run() {
+                    if (!player.isOnline()) return;
+                    Location loc = new Location(finalWorld,
+                            finalTarget.x + 0.5,
+                            finalTarget.y + 1,
+                            finalTarget.z + 0.5,
+                            player.getLocation().getYaw(),
+                            player.getLocation().getPitch());
+                    player.teleport(loc);
+                    playTeleporterEffects(loc, teleporterUsageSound);
+                    sendTeleporterPrefixedThrottled(player, msgTeleportSuccess, msgTeleportSuccessType);
+                }
+            });
             return true;
         }
 
@@ -2792,5 +2952,28 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             return result;
         }
         return Collections.emptyList();
+    }
+
+    private static String hexToMinecraft(String hex6) {
+        if (hex6 == null || hex6.length() != 6) return "";
+        StringBuilder sb = new StringBuilder(14);
+        sb.append('\u00A7').append('x');
+        for (int i = 0; i < 6; i++) {
+            sb.append('\u00A7').append(hex6.charAt(i));
+        }
+        return sb.toString();
+    }
+
+    private Block getTargetBlock(Player player, int distance) {
+        initTargetBlockExactReflection();
+        if (CACHED_GET_TARGET_BLOCK_EXACT != null) {
+            try {
+                return (Block) CACHED_GET_TARGET_BLOCK_EXACT.invoke(player, distance);
+            } catch (ReflectiveOperationException ignored) {
+            }
+        }
+        @SuppressWarnings("deprecation")
+        Block b = player.getTargetBlock((Set<Material>) null, distance);
+        return b;
     }
 }
