@@ -26,7 +26,6 @@ import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
-import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -37,7 +36,6 @@ import org.bukkit.inventory.ItemFlag;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.metadata.FixedMetadataValue;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.scheduler.BukkitRunnable;
 
 import java.io.File;
 import java.io.IOException;
@@ -92,6 +90,10 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     private static Method F_GLOBAL_RUN = null;
     private static Method F_GLOBAL_RUN_DELAYED = null;
     private static Method F_GLOBAL_RUN_AT_FIXED_RATE = null;
+
+    private static boolean HEX_SUPPORTED = false;
+    private static Method SEND_TITLE_5 = null;
+    private static Method SEND_TITLE_2 = null;
 
     private String prefix;
 
@@ -388,6 +390,28 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
+    private static void initVersionReflection() {
+        try {
+            String ver = Bukkit.getBukkitVersion();
+            String[] parts = ver.split("-")[0].split("\\.");
+            int major = Integer.parseInt(parts[0]);
+            int minor = Integer.parseInt(parts[1]);
+            HEX_SUPPORTED = (major > 1) || (major == 1 && minor >= 16);
+        } catch (Throwable ignored) {
+            HEX_SUPPORTED = false;
+        }
+        try {
+            SEND_TITLE_5 = Player.class.getMethod("sendTitle", String.class, String.class, int.class, int.class, int.class);
+        } catch (NoSuchMethodException ignored) {
+            SEND_TITLE_5 = null;
+        }
+        try {
+            SEND_TITLE_2 = Player.class.getMethod("sendTitle", String.class, String.class);
+        } catch (NoSuchMethodException ignored) {
+            SEND_TITLE_2 = null;
+        }
+    }
+
     private static void initFoliaReflection() {
         try {
             Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
@@ -431,7 +455,15 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         void run(Player player, Runnable task) {
             if (FOLIA) {
                 try {
-                    F_ENTITY_EXEC.invoke(F_ENTITY_SCHED.invoke(player), Main.this, task, (Runnable) null);
+                    Object global = F_GET_GLOBAL.invoke(Bukkit.getServer());
+                    F_GLOBAL_RUN.invoke(global, Main.this, (Consumer<Object>) t -> {
+                        if (!player.isOnline()) return;
+                        try {
+                            F_ENTITY_EXEC.invoke(F_ENTITY_SCHED.invoke(player), Main.this, task, (Runnable) null);
+                        } catch (Throwable ignored) {
+                            task.run();
+                        }
+                    });
                     return;
                 } catch (Throwable ignored) {
                 }
@@ -442,8 +474,15 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         void later(Player player, Runnable task, long delayTicks) {
             if (FOLIA) {
                 try {
-                    F_REGION_RUN_DELAYED.invoke(F_GET_REGION.invoke(Bukkit.getServer()), Main.this, player.getLocation(),
-                            (Consumer<Object>) t -> task.run(), delayTicks);
+                    Object global = F_GET_GLOBAL.invoke(Bukkit.getServer());
+                    F_GLOBAL_RUN_DELAYED.invoke(global, Main.this, (Consumer<Object>) t -> {
+                        if (!player.isOnline()) return;
+                        try {
+                            F_ENTITY_EXEC.invoke(F_ENTITY_SCHED.invoke(player), Main.this, task, (Runnable) null);
+                        } catch (Throwable ignored) {
+                            task.run();
+                        }
+                    }, delayTicks);
                     return;
                 } catch (Throwable ignored) {
                 }
@@ -454,7 +493,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         void at(Location loc, Runnable task) {
             if (FOLIA) {
                 try {
-                    F_REGION_EXEC.invoke(F_GET_REGION.invoke(Bukkit.getServer()), Main.this, loc, task);
+                    Object region = F_GET_REGION.invoke(Bukkit.getServer());
+                    F_REGION_EXEC.invoke(region, Main.this, loc, task);
                     return;
                 } catch (Throwable ignored) {
                 }
@@ -476,7 +516,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         void global(Runnable task) {
             if (FOLIA) {
                 try {
-                    F_GLOBAL_RUN.invoke(F_GET_GLOBAL.invoke(Bukkit.getServer()), Main.this, (Consumer<Object>) t -> task.run());
+                    Object global = F_GET_GLOBAL.invoke(Bukkit.getServer());
+                    F_GLOBAL_RUN.invoke(global, Main.this, (Consumer<Object>) t -> task.run());
                     return;
                 } catch (Throwable ignored) {
                 }
@@ -487,7 +528,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         void globalTimer(Runnable task, long delayTicks, long periodTicks) {
             if (FOLIA) {
                 try {
-                    F_GLOBAL_RUN_AT_FIXED_RATE.invoke(F_GET_GLOBAL.invoke(Bukkit.getServer()), Main.this,
+                    Object global = F_GET_GLOBAL.invoke(Bukkit.getServer());
+                    F_GLOBAL_RUN_AT_FIXED_RATE.invoke(global, Main.this,
                             (Consumer<Object>) t -> task.run(), delayTicks, periodTicks);
                     return;
                 } catch (Throwable ignored) {
@@ -499,7 +541,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         Object regionTimer(Location loc, Runnable task, long delayTicks, long periodTicks) {
             if (FOLIA) {
                 try {
-                    return F_REGION_RUN_AT_FIXED_RATE.invoke(F_GET_REGION.invoke(Bukkit.getServer()), Main.this, loc,
+                    Object region = F_GET_REGION.invoke(Bukkit.getServer());
+                    return F_REGION_RUN_AT_FIXED_RATE.invoke(region, Main.this, loc,
                             (Consumer<Object>) t -> task.run(), delayTicks, periodTicks);
                 } catch (Throwable ignored) {
                 }
@@ -528,10 +571,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     public void onEnable() {
         instance = this;
         initTargetBlockExactReflection();
+        initVersionReflection();
         initFoliaReflection();
         loadConfig();
         loadBlocks();
         getServer().getPluginManager().registerEvents(this, this);
+        registerChatListener();
         if (getCommand("teleporter") != null) {
             getCommand("teleporter").setExecutor(this);
             getCommand("teleporter").setTabCompleter(this);
@@ -540,6 +585,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         getLogger().info("==================================================");
         getLogger().info("   Teleporter Plugin Enabled!");
         getLogger().info("   Folia: " + FOLIA);
+        getLogger().info("   Hex colors: " + HEX_SUPPORTED);
         getLogger().info("   Elevator blocks: " + elevatorBlocks.size());
         getLogger().info("   Registered blocks: " + blockDataMap.size());
         getLogger().info("   getTargetBlockExact available: " + (CACHED_GET_TARGET_BLOCK_EXACT != null));
@@ -560,6 +606,15 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         getLogger().info("Teleporter Disabled!");
     }
 
+    private void registerChatListener() {
+        try {
+            Class<?> paperChat = Class.forName("io.papermc.paper.event.player.AsyncChatEvent");
+            getServer().getPluginManager().registerEvents(new PaperChatListener(this, paperChat), this);
+        } catch (ClassNotFoundException e) {
+            getServer().getPluginManager().registerEvents(new LegacyChatListener(this), this);
+        }
+    }
+
     private String color(String message) {
         if (message == null) return "";
         String msg = message;
@@ -567,7 +622,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         Matcher matcher = HEX_PATTERN.matcher(msg);
         StringBuffer buffer = new StringBuffer();
         while (matcher.find()) {
-            matcher.appendReplacement(buffer, Matcher.quoteReplacement(hexToMinecraft(matcher.group(1))));
+            matcher.appendReplacement(buffer, Matcher.quoteReplacement(
+                    HEX_SUPPORTED ? hexToMinecraft(matcher.group(1)) : "&f"));
         }
         matcher.appendTail(buffer);
         msg = buffer.toString();
@@ -575,7 +631,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         Matcher srgb = SRGB_PATTERN.matcher(msg);
         StringBuffer buffer2 = new StringBuffer();
         while (srgb.find()) {
-            srgb.appendReplacement(buffer2, Matcher.quoteReplacement(hexToMinecraft(srgb.group(1))));
+            srgb.appendReplacement(buffer2, Matcher.quoteReplacement(
+                    HEX_SUPPORTED ? hexToMinecraft(srgb.group(1)) : "&f"));
         }
         srgb.appendTail(buffer2);
         msg = buffer2.toString();
@@ -1128,12 +1185,32 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 player.sendMessage(formatted);
                 break;
             case TITLE:
-                player.sendTitle(formatted, "", fadeIn, stay, fadeOut);
+                sendTitleSafe(player, formatted, "", fadeIn, stay, fadeOut);
                 break;
             case SUBTITLE:
-                player.sendTitle("", formatted, fadeIn, stay, fadeOut);
+                sendTitleSafe(player, "", formatted, fadeIn, stay, fadeOut);
                 break;
         }
+    }
+
+    private void sendTitleSafe(Player player, String title, String subtitle, int fadeIn, int stay, int fadeOut) {
+        if (SEND_TITLE_5 != null) {
+            try {
+                SEND_TITLE_5.invoke(player, title, subtitle, fadeIn, stay, fadeOut);
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+        if (SEND_TITLE_2 != null) {
+            try {
+                String combined = title.isEmpty() ? subtitle : title;
+                SEND_TITLE_2.invoke(player, combined, subtitle);
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+        if (!title.isEmpty()) player.sendMessage(title);
+        else if (!subtitle.isEmpty()) player.sendMessage(subtitle);
     }
 
     private void sendElevatorMessage(Player player, String message, MessageType type) {
@@ -1316,7 +1393,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         Player player = event.getPlayer();
 
         if (event.getTo().getY() <= event.getFrom().getY()) return;
-        if (event.getFrom().getBlock().getY() == event.getTo().getBlock().getY()) return;
 
         Location feetLocation = player.getLocation().clone();
         feetLocation.setY(feetLocation.getY() - 0.1);
@@ -2317,18 +2393,16 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
-    @EventHandler
-    public void onChat(AsyncPlayerChatEvent event) {
-        Player player = event.getPlayer();
-        PendingPassword pending = pendingPasswords.get(player.getUniqueId());
+    private void handleChatInput0(Player player, String rawMessage) {
+        UUID uuid = player.getUniqueId();
+        PendingPassword pending = pendingPasswords.get(uuid);
         if (pending != null) {
             if (System.currentTimeMillis() > pending.expireTime) {
-                pendingPasswords.remove(player.getUniqueId());
+                pendingPasswords.remove(uuid);
                 return;
             }
-            event.setCancelled(true);
-            String message = event.getMessage().trim();
-            pendingPasswords.remove(player.getUniqueId());
+            String message = rawMessage.trim();
+            pendingPasswords.remove(uuid);
             if (message.equalsIgnoreCase("cancel")) {
                 player.sendMessage(color(prefix + msgCancelled));
                 return;
@@ -2355,15 +2429,14 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             });
             return;
         }
-        ChatInputSession session = chatSessions.get(player.getUniqueId());
+        ChatInputSession session = chatSessions.get(uuid);
         if (session == null) return;
         if (System.currentTimeMillis() > session.expireTime) {
-            chatSessions.remove(player.getUniqueId());
+            chatSessions.remove(uuid);
             return;
         }
-        event.setCancelled(true);
-        String message = event.getMessage().trim();
-        chatSessions.remove(player.getUniqueId());
+        String message = rawMessage.trim();
+        chatSessions.remove(uuid);
         if (message.equalsIgnoreCase("cancel")) {
             player.sendMessage(color(prefix + msgCancelled));
             return;
@@ -2379,6 +2452,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 handleChatInput(player, data, session, message);
             }
         });
+    }
+
+    boolean hasPendingChat(Player player) {
+        UUID uuid = player.getUniqueId();
+        if (pendingPasswords.containsKey(uuid)) return true;
+        return chatSessions.containsKey(uuid);
     }
 
     private void handleChatInput(Player player, BlockData data, ChatInputSession session, String message) {
@@ -2558,10 +2637,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (stand == null) {
             final String holoKey = data.key();
             final String holoName = color(data.customName);
+            final World holoWorld = w;
+            final Location holoLoc = loc;
             sched.at(loc, new Runnable() {
                 @Override
                 public void run() {
-                    ArmorStand as = w.spawn(loc, ArmorStand.class, spawned -> {
+                    ArmorStand as = holoWorld.spawn(holoLoc, ArmorStand.class, spawned -> {
                         spawned.setVisible(false);
                         spawned.setGravity(false);
                         spawned.setMarker(true);
@@ -2577,11 +2658,12 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             });
         } else {
             final ArmorStand s = stand;
+            final Location holoLoc = loc;
             final String holoName = color(data.customName);
             sched.entity(s, new Runnable() {
                 @Override
                 public void run() {
-                    s.teleport(loc);
+                    s.teleport(holoLoc);
                     s.setCustomName(holoName);
                 }
             });
@@ -2975,5 +3057,59 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         @SuppressWarnings("deprecation")
         Block b = player.getTargetBlock((Set<Material>) null, distance);
         return b;
+    }
+
+    private static class PaperChatListener implements Listener {
+        private final Main plugin;
+        private final Class<?> eventClass;
+
+        PaperChatListener(Main plugin, Class<?> eventClass) {
+            this.plugin = plugin;
+            this.eventClass = eventClass;
+        }
+
+        @EventHandler(priority = EventPriority.LOWEST)
+        public void onChat(org.bukkit.event.Event event) {
+            if (!eventClass.isInstance(event)) return;
+            try {
+                Object playerObj = eventClass.getMethod("getPlayer").invoke(event);
+                if (!(playerObj instanceof Player)) return;
+                Player player = (Player) playerObj;
+                if (!plugin.hasPendingChat(player)) return;
+                Object component = eventClass.getMethod("message").invoke(event);
+                String plain = plainText(component);
+                eventClass.getMethod("setCancelled", boolean.class).invoke(event, true);
+                plugin.handleChatInput0(player, plain);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static String plainText(Object component) {
+            try {
+                Class<?> ser = Class.forName("net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer");
+                Object serializer = ser.getMethod("plainText").invoke(null);
+                Class<?> compClass = Class.forName("net.kyori.adventure.text.Component");
+                return (String) serializer.getClass().getMethod("serialize", compClass).invoke(serializer, component);
+            } catch (Throwable ignored) {
+                return component == null ? "" : component.toString();
+            }
+        }
+    }
+
+    private static class LegacyChatListener implements Listener {
+        private final Main plugin;
+
+        LegacyChatListener(Main plugin) {
+            this.plugin = plugin;
+        }
+
+        @EventHandler(priority = EventPriority.LOWEST)
+        @SuppressWarnings("deprecation")
+        public void onChat(org.bukkit.event.player.AsyncPlayerChatEvent event) {
+            Player player = event.getPlayer();
+            if (!plugin.hasPendingChat(player)) return;
+            event.setCancelled(true);
+            plugin.handleChatInput0(player, event.getMessage());
+        }
     }
 }
