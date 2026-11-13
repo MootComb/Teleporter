@@ -26,6 +26,7 @@ import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -576,7 +577,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         loadConfig();
         loadBlocks();
         getServer().getPluginManager().registerEvents(this, this);
-        registerChatListener();
         if (getCommand("teleporter") != null) {
             getCommand("teleporter").setExecutor(this);
             getCommand("teleporter").setTabCompleter(this);
@@ -604,15 +604,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         hologramEntities.clear();
         saveBlocks();
         getLogger().info("Teleporter Disabled!");
-    }
-
-    private void registerChatListener() {
-        try {
-            Class<?> paperChat = Class.forName("io.papermc.paper.event.player.AsyncChatEvent");
-            getServer().getPluginManager().registerEvents(new PaperChatListener(this, paperChat), this);
-        } catch (ClassNotFoundException e) {
-            getServer().getPluginManager().registerEvents(new LegacyChatListener(this), this);
-        }
     }
 
     private String color(String message) {
@@ -2393,16 +2384,18 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
-    private void handleChatInput0(Player player, String rawMessage) {
-        UUID uuid = player.getUniqueId();
-        PendingPassword pending = pendingPasswords.get(uuid);
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onChat(AsyncPlayerChatEvent event) {
+        Player player = event.getPlayer();
+        PendingPassword pending = pendingPasswords.get(player.getUniqueId());
         if (pending != null) {
             if (System.currentTimeMillis() > pending.expireTime) {
-                pendingPasswords.remove(uuid);
+                pendingPasswords.remove(player.getUniqueId());
                 return;
             }
-            String message = rawMessage.trim();
-            pendingPasswords.remove(uuid);
+            event.setCancelled(true);
+            String message = event.getMessage().trim();
+            pendingPasswords.remove(player.getUniqueId());
             if (message.equalsIgnoreCase("cancel")) {
                 player.sendMessage(color(prefix + msgCancelled));
                 return;
@@ -2429,14 +2422,15 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             });
             return;
         }
-        ChatInputSession session = chatSessions.get(uuid);
+        ChatInputSession session = chatSessions.get(player.getUniqueId());
         if (session == null) return;
         if (System.currentTimeMillis() > session.expireTime) {
-            chatSessions.remove(uuid);
+            chatSessions.remove(player.getUniqueId());
             return;
         }
-        String message = rawMessage.trim();
-        chatSessions.remove(uuid);
+        event.setCancelled(true);
+        String message = event.getMessage().trim();
+        chatSessions.remove(player.getUniqueId());
         if (message.equalsIgnoreCase("cancel")) {
             player.sendMessage(color(prefix + msgCancelled));
             return;
@@ -2452,12 +2446,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 handleChatInput(player, data, session, message);
             }
         });
-    }
-
-    boolean hasPendingChat(Player player) {
-        UUID uuid = player.getUniqueId();
-        if (pendingPasswords.containsKey(uuid)) return true;
-        return chatSessions.containsKey(uuid);
     }
 
     private void handleChatInput(Player player, BlockData data, ChatInputSession session, String message) {
@@ -3057,59 +3045,5 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         @SuppressWarnings("deprecation")
         Block b = player.getTargetBlock((Set<Material>) null, distance);
         return b;
-    }
-
-    private static class PaperChatListener implements Listener {
-        private final Main plugin;
-        private final Class<?> eventClass;
-
-        PaperChatListener(Main plugin, Class<?> eventClass) {
-            this.plugin = plugin;
-            this.eventClass = eventClass;
-        }
-
-        @EventHandler(priority = EventPriority.LOWEST)
-        public void onChat(org.bukkit.event.Event event) {
-            if (!eventClass.isInstance(event)) return;
-            try {
-                Object playerObj = eventClass.getMethod("getPlayer").invoke(event);
-                if (!(playerObj instanceof Player)) return;
-                Player player = (Player) playerObj;
-                if (!plugin.hasPendingChat(player)) return;
-                Object component = eventClass.getMethod("message").invoke(event);
-                String plain = plainText(component);
-                eventClass.getMethod("setCancelled", boolean.class).invoke(event, true);
-                plugin.handleChatInput0(player, plain);
-            } catch (Throwable ignored) {
-            }
-        }
-
-        private static String plainText(Object component) {
-            try {
-                Class<?> ser = Class.forName("net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer");
-                Object serializer = ser.getMethod("plainText").invoke(null);
-                Class<?> compClass = Class.forName("net.kyori.adventure.text.Component");
-                return (String) serializer.getClass().getMethod("serialize", compClass).invoke(serializer, component);
-            } catch (Throwable ignored) {
-                return component == null ? "" : component.toString();
-            }
-        }
-    }
-
-    private static class LegacyChatListener implements Listener {
-        private final Main plugin;
-
-        LegacyChatListener(Main plugin) {
-            this.plugin = plugin;
-        }
-
-        @EventHandler(priority = EventPriority.LOWEST)
-        @SuppressWarnings("deprecation")
-        public void onChat(org.bukkit.event.player.AsyncPlayerChatEvent event) {
-            Player player = event.getPlayer();
-            if (!plugin.hasPendingChat(player)) return;
-            event.setCancelled(true);
-            plugin.handleChatInput0(player, event.getMessage());
-        }
     }
 }
