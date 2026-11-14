@@ -26,14 +26,15 @@ import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemFlag;
-import org.bukkit.inventory.ItemMeta;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.metadata.FixedMetadataValue;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
@@ -52,6 +53,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
@@ -93,6 +95,9 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
     private static Method cachedGetTargetBlockExact = null;
     private static boolean getTargetBlockExactResolved = false;
+
+    private static Method cachedTeleportAsync = null;
+    private static boolean teleportAsyncResolved = false;
 
     private static final Map<String, Material> materialCache = new ConcurrentHashMap<>();
     private static final Map<Material, Short> materialDataCache = new ConcurrentHashMap<>();
@@ -568,6 +573,44 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
+    private static void initTeleportAsyncReflection() {
+        if (teleportAsyncResolved) {
+            return;
+        }
+        teleportAsyncResolved = true;
+        try {
+            cachedTeleportAsync = Entity.class.getMethod("teleportAsync", Location.class);
+            cachedTeleportAsync.setAccessible(true);
+        } catch (NoSuchMethodException ignored) {
+            cachedTeleportAsync = null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean tryTeleportAsync(Entity entity, Location location, Consumer<Boolean> callback) {
+        initTeleportAsyncReflection();
+        if (cachedTeleportAsync == null || entity == null || location == null) {
+            return false;
+        }
+        try {
+            Object result = cachedTeleportAsync.invoke(entity, location);
+            if (result instanceof CompletableFuture<?>) {
+                ((CompletableFuture<Boolean>) result).thenAccept(ok -> {
+                    if (callback != null) {
+                        callback.accept(ok != null && ok);
+                    }
+                });
+                return true;
+            }
+            if (callback != null) {
+                callback.accept(true);
+            }
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static void initVersionReflection() {
         try {
             String version = Bukkit.getBukkitVersion();
@@ -827,16 +870,13 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (player == null || !player.isOnline()) {
             return;
         }
-        if (folia) {
-            try {
-                player.teleportAsync(location).thenAccept(success -> {
-                    if (success && onSuccess != null && player.isOnline()) {
-                        sched.entity(player, onSuccess);
-                    }
-                });
-                return;
-            } catch (Throwable ignored) {
+        boolean started = tryTeleportAsync(player, location, ok -> {
+            if (ok && onSuccess != null && player.isOnline()) {
+                sched.entity(player, onSuccess);
             }
+        });
+        if (started) {
+            return;
         }
         if (Bukkit.isPrimaryThread()) {
             player.teleport(location);
@@ -857,6 +897,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     public void onEnable() {
         instance = this;
         initTargetBlockExactReflection();
+        initTeleportAsyncReflection();
         initVersionReflection();
         initFoliaReflection();
         loadConfig();
@@ -864,18 +905,9 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
         getServer().getPluginManager().registerEvents(this, this);
 
-        if (isPaperChatAvailable()) {
-            getServer().getPluginManager().registerEvents(new PaperChatListener(), this);
-        } else {
-            getServer().getPluginManager().registerEvents(new LegacyChatListener(), this);
-        }
-
         if (getCommand("teleporter") != null) {
             getCommand("teleporter").setExecutor(this);
             getCommand("teleporter").setTabCompleter(this);
-        }
-        if (getCommand("tpinput") != null) {
-            getCommand("tpinput").setExecutor(this);
         }
 
         startHologramUpdater();
@@ -887,16 +919,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         getLogger().info("   Elevator blocks: " + elevatorBlocks.size());
         getLogger().info("   Registered blocks: " + blockDataMap.size());
         getLogger().info("   getTargetBlockExact available: " + (cachedGetTargetBlockExact != null));
+        getLogger().info("   teleportAsync available: " + (cachedTeleportAsync != null));
         getLogger().info("==================================================");
-    }
-
-    private boolean isPaperChatAvailable() {
-        try {
-            Class.forName("io.papermc.paper.event.player.AsyncChatEvent");
-            return true;
-        } catch (ClassNotFoundException e) {
-            return false;
-        }
     }
 
     @Override
@@ -3154,14 +3178,17 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
     }
 
-    private void handleChatMessage(Player player, String rawMessage) {
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onChat(AsyncPlayerChatEvent event) {
+        Player player = event.getPlayer();
         PendingPassword pending = pendingPasswords.get(player.getUniqueId());
         if (pending != null) {
             if (System.currentTimeMillis() > pending.expireTime) {
                 pendingPasswords.remove(player.getUniqueId());
                 return;
             }
-            String message = rawMessage.trim();
+            event.setCancelled(true);
+            String message = event.getMessage().trim();
             pendingPasswords.remove(player.getUniqueId());
             if (message.equalsIgnoreCase("cancel")) {
                 player.sendMessage(color(prefix + msgCancelled));
@@ -3195,7 +3222,8 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             chatSessions.remove(player.getUniqueId());
             return;
         }
-        String message = rawMessage.trim();
+        event.setCancelled(true);
+        String message = event.getMessage().trim();
         chatSessions.remove(player.getUniqueId());
         if (message.equalsIgnoreCase("cancel")) {
             player.sendMessage(color(prefix + msgCancelled));
@@ -3207,39 +3235,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
             return;
         }
         sched.entity(player, () -> handleChatInput(player, data, session, message));
-    }
-
-    private boolean hasPendingChatInput(Player player) {
-        return pendingPasswords.containsKey(player.getUniqueId())
-                || chatSessions.containsKey(player.getUniqueId());
-    }
-
-    private class PaperChatListener implements Listener {
-        @EventHandler(priority = EventPriority.LOWEST)
-        public void onChat(io.papermc.paper.event.player.AsyncChatEvent event) {
-            Player player = event.getPlayer();
-            if (!hasPendingChatInput(player)) {
-                return;
-            }
-            event.setCancelled(true);
-            String message = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
-                    .plainText()
-                    .serialize(event.message());
-            handleChatMessage(player, message);
-        }
-    }
-
-    private class LegacyChatListener implements Listener {
-        @SuppressWarnings("deprecation")
-        @EventHandler(priority = EventPriority.LOWEST)
-        public void onChat(org.bukkit.event.player.AsyncPlayerChatEvent event) {
-            Player player = event.getPlayer();
-            if (!hasPendingChatInput(player)) {
-                return;
-            }
-            event.setCancelled(true);
-            handleChatMessage(player, event.getMessage());
-        }
     }
 
     private void handleChatInput(Player player, BlockData data, ChatInputSession session, String message) {
@@ -3466,11 +3461,10 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         final ArmorStand finalStand = stand;
         final String hologramName = color(data.customName);
         sched.entity(finalStand, () -> {
-            try {
-                finalStand.teleport(location);
-            } catch (Throwable t) {
+            if (!tryTeleportAsync(finalStand, location, ok -> {
+            })) {
                 try {
-                    finalStand.teleportAsync(location);
+                    finalStand.teleport(location);
                 } catch (Throwable ignored) {
                 }
             }
@@ -3666,22 +3660,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (command.getName().equalsIgnoreCase("tpinput")) {
-            if (!(sender instanceof Player)) {
-                sender.sendMessage(color(prefix + msgPlayersOnly));
-                return true;
-            }
-            Player player = (Player) sender;
-            if (args.length < 1) {
-                return true;
-            }
-            if (!hasPendingChatInput(player)) {
-                return true;
-            }
-            handleChatMessage(player, String.join(" ", args));
-            return true;
-        }
-
         if (!command.getName().equalsIgnoreCase("teleporter")) {
             return false;
         }
