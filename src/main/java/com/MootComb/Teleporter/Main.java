@@ -1952,7 +1952,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 if (!elevatorBlocks.contains(checkLocation.getBlock().getType())) {
                     continue;
                 }
-                final Location targetLocation = checkLocation.clone().subtract(0, 0.65, 0);
+                final Location targetLocation = checkLocation.clone().subtract(0, 1.65, 0);
                 if (!isSafeLocation(targetLocation, false)) {
                     sendElevatorPrefixedThrottled(player, msgElevatorDanger, msgElevatorDangerType);
                     return;
