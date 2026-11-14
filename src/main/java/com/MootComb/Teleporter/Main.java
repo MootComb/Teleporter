@@ -2849,15 +2849,47 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (openedInventory == null) {
             return;
         }
-        if (event.getInventory() != openedInventory) {
+
+        Inventory clickedInventory = event.getClickedInventory();
+        boolean clickedTop = clickedInventory == openedInventory;
+        boolean clickedBottom = event.getView().getBottomInventory() == clickedInventory;
+        boolean clickedOutside = clickedInventory == null;
+
+        if (clickedTop || clickedBottom || clickedOutside) {
+            event.setCancelled(true);
+        }
+
+        if (event.isShiftClick()) {
+            event.setCancelled(true);
+        }
+
+        org.bukkit.event.inventory.ClickType clickType = event.getClick();
+
+        if (clickType == org.bukkit.event.inventory.ClickType.NUMBER_KEY) {
+            event.setCancelled(true);
+        }
+        if (clickType == org.bukkit.event.inventory.ClickType.DOUBLE_CLICK) {
+            event.setCancelled(true);
+        }
+        if (clickType == org.bukkit.event.inventory.ClickType.DROP) {
+            event.setCancelled(true);
+        }
+        if (clickType == org.bukkit.event.inventory.ClickType.CONTROL_DROP) {
+            event.setCancelled(true);
+        }
+        if (clickType == org.bukkit.event.inventory.ClickType.SWAP_OFFHAND) {
+            event.setCancelled(true);
+        }
+
+        if (!clickedTop) {
             return;
         }
-        event.setCancelled(true);
 
         GuiContext context = guiContexts.get(uuid);
         if (context == null) {
             return;
         }
+
         BlockData data = blockDataMap.get(context.blockKey);
         if (data == null) {
             player.closeInventory();
@@ -2868,18 +2900,20 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (slot < 0 || slot >= event.getInventory().getSize()) {
             return;
         }
+
         Map<Integer, GuiItemMeta> slotMap = guiItemMetaMap.get(uuid);
         if (slotMap == null) {
             return;
         }
+
         GuiItemMeta meta = slotMap.get(slot);
         if (meta == null) {
             return;
         }
 
         List<String> commands;
-        org.bukkit.event.inventory.ClickType click = event.getClick();
-        switch (click) {
+
+        switch (clickType) {
             case LEFT:
                 commands = meta.leftCommands;
                 break;
@@ -2887,18 +2921,28 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 commands = meta.rightCommands;
                 break;
             case SHIFT_LEFT:
-                commands = !meta.shiftLeftCommands.isEmpty() ? meta.shiftLeftCommands : meta.leftCommands;
+                if (!meta.shiftLeftCommands.isEmpty()) {
+                    commands = meta.shiftLeftCommands;
+                } else {
+                    commands = meta.leftCommands;
+                }
                 break;
             case SHIFT_RIGHT:
-                commands = !meta.shiftRightCommands.isEmpty() ? meta.shiftRightCommands : meta.rightCommands;
+                if (!meta.shiftRightCommands.isEmpty()) {
+                    commands = meta.shiftRightCommands;
+                } else {
+                    commands = meta.rightCommands;
+                }
                 break;
             default:
                 commands = new ArrayList<>();
                 break;
         }
+
         if (commands == null || commands.isEmpty()) {
             return;
         }
+
         for (String command : commands) {
             handleGuiCommand(player, data, command, meta, slot);
         }
