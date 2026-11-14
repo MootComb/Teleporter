@@ -1900,7 +1900,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
                 if (!elevatorBlocks.contains(checkLocation.getBlock().getType())) {
                     continue;
                 }
-                final Location targetLocation = checkLocation.clone().add(0, 1, 0);
+                final Location targetLocation = checkLocation.clone();
                 sched.at(targetLocation, () -> {
                     if (!player.isOnline()) {
                         return;
