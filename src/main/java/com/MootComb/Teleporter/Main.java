@@ -2842,14 +2842,15 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (!(event.getWhoClicked() instanceof Player)) return;
         Player player = (Player) event.getWhoClicked();
         UUID uuid = player.getUniqueId();
+        
+        Inventory opened = openGuis.get(uuid);
+        if (opened == null) return;
 
         getLogger().info("[GUI-DEBUG] click=" + event.getClick()
                 + " rawSlot=" + event.getRawSlot()
                 + " top=" + (event.getView().getTopInventory() == opened)
                 + " sameSize=" + (event.getInventory().getSize() == opened.getSize()));
         
-        Inventory opened = openGuis.get(uuid);
-        if (opened == null) return;
         if (event.getView().getTopInventory() != opened) return;
 
         event.setCancelled(true);
