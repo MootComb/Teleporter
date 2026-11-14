@@ -1925,53 +1925,37 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPlayerJump(PlayerMoveEvent event) {
         Player player = event.getPlayer();
-        if (event.getTo() == null) {
-            return;
-        }
-        if (event.getTo().getY() <= event.getFrom().getY()) {
-            return;
-        }
-        UUID uuid = player.getUniqueId();
-        if (jumpingPlayers.contains(uuid)) {
-            return;
-        }
-        if (!usageAllowed(player, "Elevator")) {
-            return;
-        }
+
+        if (event.getTo().getY() <= event.getFrom().getY()) return;
+        if (event.getFrom().getBlock().getY() == event.getTo().getBlock().getY()) return;
+
         Location feetLocation = player.getLocation().clone();
         feetLocation.setY(feetLocation.getY() - 0.1);
-        sched.at(feetLocation, () -> {
-            if (!player.isOnline()) {
+
+        if (!usageAllowed(player, "Elevator")) return;
+        if (!elevatorBlocks.contains(feetLocation.getBlock().getType())) return;
+
+        for (int i = 1; i <= blockDistance; i++) {
+            Location checkLoc = feetLocation.clone().add(0, i, 0);
+            if (!elevatorBlocks.contains(checkLoc.getBlock().getType())) continue;
+
+            Location targetLoc = checkLoc.clone().subtract(0, 0.65, 0);
+            if (!isSafeLocation(targetLoc, false)) {
+                sendElevatorPrefixedThrottled(player, msgElevatorDanger, msgElevatorDangerType);
                 return;
             }
-            if (!elevatorBlocks.contains(feetLocation.getBlock().getType())) {
-                return;
-            }
-            for (int i = 1; i <= blockDistance; i++) {
-                Location checkLocation = feetLocation.clone().add(0, i, 0);
-                if (!elevatorBlocks.contains(checkLocation.getBlock().getType())) {
-                    continue;
-                }
-                Location targetLocation = checkLocation.clone().subtract(0, 0.65, 0);
-                if (!isSafeLocation(targetLocation, false)) {
-                    sendElevatorPrefixedThrottled(player, msgElevatorDanger, msgElevatorDangerType);
-                    return;
-                }
-                if (isOnCooldown(player)) {
-                    return;
-                }
-                jumpingPlayers.add(uuid);
-                player.setVelocity(new Vector(0, 0, 0));
-                player.setFallDistance(0);
-                teleportPlayer(player, targetLocation, () -> {
-                    sched.at(targetLocation, () -> playElevatorEffects(targetLocation, elevatorUsageSound));
-                    sendElevatorPrefixedThrottled(player, msgElevatorUp, msgElevatorUpType);
-                    setCooldown(player);
-                    sched.entityLater(player, () -> jumpingPlayers.remove(uuid), 10L);
-                });
-                return;
-            }
-        });
+
+            if (isOnCooldown(player)) return;
+
+            player.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
+            player.setFallDistance(0);
+            player.teleport(targetLoc);
+            playElevatorEffects(targetLoc, elevatorUsageSound);
+            sendElevatorPrefixedThrottled(player, msgElevatorUp, msgElevatorUpType);
+            setCooldown(player);
+
+            return;
+        }
     }
 
     @EventHandler
@@ -2845,11 +2829,6 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         
         Inventory opened = openGuis.get(uuid);
         if (opened == null) return;
-
-        getLogger().info("[GUI-DEBUG] click=" + event.getClick()
-                + " rawSlot=" + event.getRawSlot()
-                + " top=" + (event.getView().getTopInventory() == opened)
-                + " sameSize=" + (event.getInventory().getSize() == opened.getSize()));
         
         if (event.getView().getTopInventory() != opened) return;
 
@@ -2865,7 +2844,10 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         }
 
         int slot = event.getRawSlot();
-        if (slot < 0 || slot >= event.getInventory().getSize()) return;
+        int rawSlot = event.getRawSlot();
+        if (rawSlot < 0 || rawSlot >= opened.getSize()) {
+            return;
+        }
 
         Map<Integer, GuiItemMeta> slotMap = guiItemMetaMap.get(uuid);
         if (slotMap == null) return;
