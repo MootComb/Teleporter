@@ -2877,7 +2877,7 @@ public final class Main extends JavaPlugin implements Listener, TabCompleter {
         if (clickType == org.bukkit.event.inventory.ClickType.CONTROL_DROP) {
             event.setCancelled(true);
         }
-        if (clickType == org.bukkit.event.inventory.ClickType.SWAP_OFFHAND) {
+        if (clickType.name().equals("SWAP_OFFHAND")) {
             event.setCancelled(true);
         }
 
